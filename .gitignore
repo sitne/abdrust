@@ -1,0 +1,21 @@
+# Local environment
+.env
+.env.local
+.env.*.local
+
+# Rust build artifacts
+/target
+/backend/target
+**/target
+
+# Frontend build artifacts
+/frontend/node_modules
+/frontend/dist
+/frontend/.vite
+
+# OS / editor noise
+.DS_Store
+.idea/
+.vscode/
+*.swp
+*.log
