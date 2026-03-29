@@ -13,6 +13,11 @@
 /frontend/dist
 /frontend/.vite
 
+# Tooling output
+*.tsbuildinfo
+.playwright-report/
+.lighthouseci/
+
 # OS / editor noise
 .DS_Store
 .idea/

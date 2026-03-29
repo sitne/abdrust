@@ -101,3 +101,8 @@ URL Override は使わず、Discord の Activity Shelf から起動します。
 - `docs/security-and-multiguild.md`
 - `docs/performance-notes.md`
 - `docs/review-checklist.md`
+
+## License
+
+- Repository code and original documentation: MIT, see `LICENSE`
+- `protocol.md`: separate CC BY-NC-SA 4.0 notice, see `THIRD_PARTY_NOTICES.md`
