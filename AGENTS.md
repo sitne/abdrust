@@ -21,6 +21,13 @@ The goal is not a quick prototype: it is a maintainable platform where the Activ
 - When changing voice behavior, verify the bot side and the Activity side together.
 - If a change affects Discord integration, keep logs and debugging output useful.
 
+## GitHub Research
+
+- Use `gh search repos`, `gh search issues`, `gh search prs`, and `gh search code` when choosing Rust or Discord libraries.
+- Prefer official repository sources, README files, Cargo manifests, and upstream issues over secondary summaries.
+- Treat search results as pointers; verify important details in the actual repository contents before deciding.
+- When comparing implementations, collect a small set of candidate repos first, then inspect their code patterns and maintenance state.
+
 ## Validation
 
 - Backend changes must pass `cargo test`.
