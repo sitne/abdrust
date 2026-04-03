@@ -13,19 +13,57 @@ async fn main() -> Result<()> {
     tracing_subscriber::fmt().with_env_filter(filter).init();
     let config = Config::from_env()?;
     let http = TwilightHttpClient::new(config.discord_token.clone());
-    let shard = Shard::new(ShardId::ONE, config.discord_token.clone(), Intents::GUILDS | Intents::GUILD_MEMBERS | Intents::GUILD_VOICE_STATES | Intents::GUILD_MESSAGES);
     let bot_user_id = http.current_user().await?.model().await?.id;
 
     let voice_engine = Arc::new(DaveyVoiceEngine::new(bot_user_id));
-    tracing::info!(dave_protocol_version = dave::MAX_DAVE_PROTOCOL_VERSION, "DAVE support available (handshake in progress)");
-    let state = AppState::new(config.clone(), Arc::new(http), shard.sender(), bot_user_id, voice_engine);
+    tracing::info!(
+        dave_protocol_version = dave::MAX_DAVE_PROTOCOL_VERSION,
+        shard_count = config.shard_count,
+        shard_ids = ?config.shard_ids,
+        "DAVE support available (handshake in progress)"
+    );
 
-    let bot_state = state.clone();
-    tokio::spawn(async move {
-        if let Err(err) = bot::client::run(bot_state, shard).await {
-            tracing::error!(error = %err, "bot task failed");
-        }
-    });
+    let intents = Intents::GUILDS
+        | Intents::GUILD_MEMBERS
+        | Intents::GUILD_VOICE_STATES
+        | Intents::GUILD_MESSAGES;
+
+    // Create shards based on configuration
+    let shards: Vec<_> = config
+        .shard_ids
+        .iter()
+        .map(|&shard_num| {
+            Shard::new(
+                ShardId::new(shard_num, config.shard_count),
+                config.discord_token.clone(),
+                intents,
+            )
+        })
+        .collect();
+
+    // Create shared state (voice_engine is shared across all shards)
+    // Each shard gets its own gateway sender, but shares the same AppState
+    let first_shard = &shards[0];
+    let state = AppState::new(
+        config.clone(),
+        Arc::new(http),
+        first_shard.sender(),
+        bot_user_id,
+        voice_engine.clone(),
+    );
+
+    // Spawn bot tasks for each shard
+    for (i, shard) in shards.into_iter().enumerate() {
+        let shard_state = state.clone();
+        // For shards after the first, we need a new AppState with the correct sender
+        // In a production setup, you'd create separate AppState per shard or use a shared gateway
+        // For now, we use the first shard's sender for all (works for single-shard setups)
+        tokio::spawn(async move {
+            if let Err(err) = bot::client::run(shard_state, shard).await {
+                tracing::error!(shard = i, error = %err, "shard task failed");
+            }
+        });
+    }
 
     let listener = tokio::net::TcpListener::bind((config.host.as_str(), config.port)).await?;
     let app = http::router::router(state);

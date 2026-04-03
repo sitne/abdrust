@@ -29,10 +29,15 @@ async function getDiscordSdk() {
 export async function initDiscord() {
   if (isToolingMode()) {
     sessionStorage.setItem('abdrust-session-id', 'tooling-session')
+    sessionStorage.setItem('abdrust-instance-id', 'tooling-instance')
     return 'tooling-session'
   }
 
   const discordSdk = await getDiscordSdk()
+
+  // Store instanceId — this uniquely identifies this Activity session
+  // Format: i-{launch_id}-gc-{guild_id}-{channel_id}
+  sessionStorage.setItem('abdrust-instance-id', discordSdk.instanceId)
 
   const { code } = await discordSdk.commands.authorize({
     client_id: getClientId(),
@@ -66,4 +71,8 @@ export async function initDiscord() {
 
 export function getSessionId() {
   return sessionStorage.getItem('abdrust-session-id') ?? ''
+}
+
+export function getInstanceId() {
+  return sessionStorage.getItem('abdrust-instance-id') ?? ''
 }

@@ -87,6 +87,15 @@ pub struct HeartbeatPayload {
     pub seq_ack: i64,
 }
 
+/// Resume payload (opcode 7) - v8 format
+#[derive(Debug, Serialize)]
+pub struct ResumePayload {
+    pub server_id: String,
+    pub session_id: String,
+    pub token: String,
+    pub seq_ack: i64,
+}
+
 /// Session Description payload (opcode 4)
 #[derive(Debug, Deserialize)]
 pub struct SessionDescriptionPayload {
@@ -350,6 +359,20 @@ impl VoiceGateway {
         };
 
         self.send_json(3, &payload).await?;
+        Ok(())
+    }
+
+    /// Send resume (opcode 7) - v8 format
+    pub async fn resume(&mut self) -> Result<()> {
+        let payload = ResumePayload {
+            server_id: self.server_id.clone(),
+            session_id: self.session_id.clone(),
+            token: self.token.clone(),
+            seq_ack: self.last_seq,
+        };
+
+        self.send_json(7, &payload).await?;
+        info!("Sent voice resume (session={}, seq_ack={})", self.session_id, self.last_seq);
         Ok(())
     }
 
@@ -692,6 +715,11 @@ impl VoiceGateway {
     /// Get current state
     pub fn state(&self) -> GatewayState {
         self.state
+    }
+
+    /// Get last received sequence number
+    pub fn last_seq(&self) -> i64 {
+        self.last_seq
     }
 
     /// Get or create DAVE session

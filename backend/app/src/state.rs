@@ -33,6 +33,21 @@ pub struct BotState {
     pub auth_sessions: Mutex<HashMap<String, AuthSession>>,
     pub bot_pending_session_id: Mutex<HashMap<Id<GuildMarker>, String>>,
     pub pending_voice_info: Mutex<HashMap<Id<GuildMarker>, PendingVoiceInfo>>,
+    pub metrics: Mutex<VoiceMetrics>,
+}
+
+/// Simple voice metrics counters
+#[derive(Clone, Default, Debug)]
+pub struct VoiceMetrics {
+    pub total_joins: u64,
+    pub total_leaves: u64,
+    pub total_voice_frames: u64,
+    pub total_dave_decrypted: u64,
+    pub total_passthrough_frames: u64,
+    pub total_reconnects: u64,
+    pub total_heartbeat_acks: u64,
+    pub total_heartbeat_timeouts: u64,
+    pub current_active_connections: u64,
 }
 
 #[derive(Clone, Debug)]
@@ -263,6 +278,7 @@ impl AppState {
             auth_sessions: Mutex::new(HashMap::new()),
             pending_voice_info: Mutex::new(HashMap::new()),
             bot_pending_session_id: Mutex::new(HashMap::new()),
+            metrics: Mutex::new(VoiceMetrics::default()),
         });
         let activity = Arc::new(Mutex::new(ActivityState {
             sessions: HashMap::new(),
@@ -305,6 +321,21 @@ impl AppState {
 
     pub async fn remove_voice_session(&self, guild_id: Id<GuildMarker>) {
         self.bot.voice_sessions.lock().await.remove(&guild_id);
+    }
+
+    /// Check if there's an active voice session for a guild (by string ID)
+    pub async fn voice_session_by_guild_id(&self, guild_id_str: &str) -> Option<VoiceSession> {
+        let sessions = self.bot.voice_sessions.lock().await;
+        sessions.values().find(|s| s.guild_id == guild_id_str).cloned()
+    }
+
+    pub async fn voice_metrics(&self) -> VoiceMetrics {
+        self.bot.metrics.lock().await.clone()
+    }
+
+    pub async fn increment_voice_metric(&self, metric: impl FnOnce(&mut VoiceMetrics)) {
+        let mut metrics = self.bot.metrics.lock().await;
+        metric(&mut *metrics);
     }
 
     pub async fn voice_metadata_for_guild(&self, guild_id: Id<GuildMarker>) -> Arc<Mutex<HashMap<Id<UserMarker>, VoiceUserMeta>>> {

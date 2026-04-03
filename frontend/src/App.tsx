@@ -1,5 +1,5 @@
 import { useEffect, useMemo, useState } from 'react'
-import { getSessionId, initDiscord } from './discord'
+import { getSessionId, getInstanceId, initDiscord } from './discord'
 import { isToolingMode, makeLocalGuildId } from './dev'
 import { WsClient } from './ws'
 
@@ -104,7 +104,7 @@ export default function App() {
           setBotStatus({ status: 'tooling' })
           return
         }
-        ws.connect(guildId)
+        ws.connect(guildId, getInstanceId() || undefined)
         const sessionId = getSessionId()
         if (sessionId) {
           ws.setSessionId(sessionId)

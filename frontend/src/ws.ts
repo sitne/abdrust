@@ -11,6 +11,7 @@ export class WsClient<TStatus = unknown, TEvent = unknown> {
   private statusListeners = new Set<StatusListener<TStatus>>()
   private reconnectAttempts = 0
   private guildId?: string
+  private instanceId?: string
   private shouldReconnect = true
   private pendingSessionId?: string
   private readonly toolingMode = isToolingMode()
@@ -27,8 +28,9 @@ export class WsClient<TStatus = unknown, TEvent = unknown> {
     return () => this.statusListeners.delete(listener)
   }
 
-  connect(guildId: string) {
+  connect(guildId: string, instanceId?: string) {
     this.guildId = guildId
+    this.instanceId = instanceId
     if (this.toolingMode) return
     this.shouldReconnect = true
     this.open()
@@ -63,7 +65,7 @@ export class WsClient<TStatus = unknown, TEvent = unknown> {
     this.socket.onopen = () => {
       this.reconnectAttempts = 0
       if (this.pendingSessionId) this.send({ type: 'session', session_id: this.pendingSessionId })
-      if (this.guildId) this.send({ type: 'subscribe', guild_id: this.guildId })
+      if (this.guildId) this.send({ type: 'subscribe', guild_id: this.guildId, instance_id: this.instanceId })
     }
     this.socket.onmessage = (event) => {
       try {

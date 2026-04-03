@@ -9,6 +9,7 @@ struct ClientMsg {
     r#type: String,
     guild_id: Option<String>,
     session_id: Option<String>,
+    instance_id: Option<String>,
 }
 
 #[derive(serde::Serialize)]
@@ -26,6 +27,7 @@ async fn handle_socket(state: AppState, socket: WebSocket) {
     let mut ready_rx = state.ready_tx.subscribe();
     let (mut tx, mut rx_ws) = socket.split();
     let mut subscribed: Option<String> = None;
+    let mut instance_id: Option<String> = None;
     let mut session_ok = false;
     let auth_required = matches!(state.config.activity_mode, crate::config::ActivityMode::Discord);
     let mut authorized_guilds: Option<Vec<String>> = None;
@@ -45,7 +47,10 @@ async fn handle_socket(state: AppState, socket: WebSocket) {
                     Some(Ok(Message::Text(text))) => {
                         if let Ok(client_msg) = serde_json::from_str::<ClientMsg>(&text) {
                             match client_msg.r#type.as_str() {
-                                "subscribe" => subscribed = client_msg.guild_id,
+                                "subscribe" => {
+                                    subscribed = client_msg.guild_id;
+                                    instance_id = client_msg.instance_id;
+                                }
                                 "session" => {
                                     if let Some(session_id) = client_msg.session_id {
                                         if let Some(session) = state.auth_session(&session_id).await {
@@ -89,7 +94,7 @@ async fn handle_socket(state: AppState, socket: WebSocket) {
             event = rx.recv() => {
                 match event {
                     Ok(event) => {
-                        if should_forward(&subscribed, session_ok, authorized_guilds.as_deref(), auth_required, &event) {
+                        if should_forward(&subscribed, session_ok, authorized_guilds.as_deref(), auth_required, &event, &state).await {
                             let envelope = EventEnvelope { r#type: "event", data: &event };
                             if let Ok(text) = serde_json::to_string(&envelope) {
                                 let _ = tx.send(Message::text(text)).await;
@@ -104,10 +109,39 @@ async fn handle_socket(state: AppState, socket: WebSocket) {
     }
 }
 
-fn should_forward(subscribed: &Option<String>, session_ok: bool, authorized_guilds: Option<&[String]>, auth_required: bool, event: &AppEvent) -> bool {
+async fn should_forward(subscribed: &Option<String>, session_ok: bool, authorized_guilds: Option<&[String]>, auth_required: bool, event: &AppEvent, state: &AppState) -> bool {
     if auth_required && !session_ok {
         return false;
     }
+
+    // Check if this is a voice-related event that requires the bot to be in a voice channel
+    let is_voice_event = matches!(event,
+        AppEvent::VoiceStateUpdate { .. }
+        | AppEvent::VoiceSpeaking { .. }
+        | AppEvent::VoiceAudioFrame { .. }
+        | AppEvent::VoiceStream { .. }
+        | AppEvent::VoiceReceiveTrace { .. }
+        | AppEvent::VoiceSignalTrace { .. }
+    );
+
+    // Only forward voice events if the bot has an active voice session for that guild
+    if is_voice_event {
+        let guild_id = match event {
+            AppEvent::VoiceStateUpdate { guild_id, .. } => guild_id,
+            AppEvent::VoiceSpeaking { guild_id, .. } => guild_id,
+            AppEvent::VoiceAudioFrame { guild_id, .. } => guild_id,
+            AppEvent::VoiceStream { guild_id, .. } => guild_id,
+            AppEvent::VoiceReceiveTrace { trace } => &trace.guild_id,
+            AppEvent::VoiceSignalTrace { trace } => &trace.guild_id,
+            _ => return false,
+        };
+
+        // Check if bot has an active voice session for this guild
+        if state.voice_session_by_guild_id(guild_id).await.is_none() {
+            return false;
+        }
+    }
+
     match (subscribed, event) {
         (Some(guild), AppEvent::VoiceStateUpdate { guild_id, .. }) => guild == guild_id && authorized_guilds.map(|allowed| allowed.iter().any(|id| id == guild_id)).unwrap_or(true),
         (Some(guild), AppEvent::VoiceSpeaking { guild_id, .. }) => guild == guild_id && authorized_guilds.map(|allowed| allowed.iter().any(|id| id == guild_id)).unwrap_or(true),
@@ -115,7 +149,7 @@ fn should_forward(subscribed: &Option<String>, session_ok: bool, authorized_guil
         (Some(guild), AppEvent::VoiceStream { guild_id, .. }) => guild == guild_id && authorized_guilds.map(|allowed| allowed.iter().any(|id| id == guild_id)).unwrap_or(true),
         (Some(guild), AppEvent::VoiceReceiveTrace { trace }) => guild == &trace.guild_id && authorized_guilds.map(|allowed| allowed.iter().any(|id| id == &trace.guild_id)).unwrap_or(true),
         (Some(guild), AppEvent::VoiceSignalTrace { trace }) => guild == &trace.guild_id && authorized_guilds.map(|allowed| allowed.iter().any(|id| id == &trace.guild_id)).unwrap_or(true),
-        (Some(guild), AppEvent::VoiceJoinState { state }) => match state {
+        (Some(guild), AppEvent::VoiceJoinState { state: vs }) => match vs {
             crate::state::VoiceJoinState::Idle { guild_id }
             | crate::state::VoiceJoinState::Joining { guild_id, .. }
             | crate::state::VoiceJoinState::Joined { guild_id, .. }

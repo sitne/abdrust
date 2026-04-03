@@ -39,6 +39,7 @@ pub fn router(state: AppState) -> Router {
         .route("/api/guild/{guild_id}", get(api::guild))
         .route("/api/guild/{guild_id}/voice", get(api::voice))
         .route("/api/private/guild/{guild_id}/voice", get(api::voice_private))
+        .route("/api/metrics", get(api::metrics))
         .route("/ws", get(ws::ws))
         .route("/api/health", get(|| async { axum::Json(serde_json::json!({"ok": true})) }))
         .fallback_service(

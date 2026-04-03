@@ -180,9 +180,13 @@ impl DaveyVoiceEngine {
         }
         info!("Sent voice identify");
 
-        // Heartbeat timer
+        // Heartbeat timer — will be updated when Hello is received
         let mut heartbeat_interval = tokio::time::interval(Duration::from_secs(5));
-        heartbeat_interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+        heartbeat_interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+        let mut heartbeat_pending = true; // Wait for Hello before sending first heartbeat
+        let mut last_heartbeat_ack = std::time::Instant::now();
+        let mut consecutive_missed_acks: u32 = 0;
+        const MAX_MISSED_ACKS: u32 = 3;
 
         // UDP socket for receiving audio
         let udp_socket: Arc<Mutex<Option<VoiceUdpSocket>>> = Arc::new(Mutex::new(None));
@@ -209,8 +213,29 @@ impl DaveyVoiceEngine {
                     }
                 }
                 _ = heartbeat_interval.tick() => {
+                    if heartbeat_pending {
+                        // Don't send heartbeat until we receive Hello
+                        continue;
+                    }
                     if let Err(e) = gateway.heartbeat().await {
-                        warn!("Heartbeat failed: {}", e);
+                        warn!("Heartbeat send failed: {}", e);
+                    } else {
+                        debug!("Heartbeat sent (seq_ack={})", gateway.last_seq());
+                    }
+                }
+                // Heartbeat health check — detect missed ACKs
+                _ = tokio::time::sleep(Duration::from_secs(30)) => {
+                    if !heartbeat_pending && last_heartbeat_ack.elapsed() > Duration::from_secs(60) {
+                        consecutive_missed_acks += 1;
+                        warn!(
+                            missed_acks = consecutive_missed_acks,
+                            last_ack_ago = ?last_heartbeat_ack.elapsed(),
+                            "Heartbeat ACK not received"
+                        );
+                        if consecutive_missed_acks >= MAX_MISSED_ACKS {
+                            error!("Too many missed heartbeat ACKs, reconnecting");
+                            return DisconnectReason::GatewayError("heartbeat timeout".to_string());
+                        }
                     }
                 }
                 // UDP receive (non-blocking poll)
@@ -243,16 +268,60 @@ impl DaveyVoiceEngine {
                                                     if has_dave_marker {
                                                         match session.decrypt(sender_user_id, payload) {
                                                             Ok(decrypted) => {
-                                                                debug!("Decrypted audio: {} bytes for user {}", decrypted.len(), sender_user_id);
+                                                                debug!("Decrypted DAVE audio: {} bytes for user {}", decrypted.len(), sender_user_id);
+                                                                // decrypted is still Opus-encoded — decode to PCM
+                                                                let samples = if let Some(decoder) = opus_decoder.as_mut() {
+                                                                    match decoder.decode(&decrypted) {
+                                                                        Ok(pcm) => {
+                                                                            debug!("Decoded DAVE Opus: {} bytes -> {} PCM samples", decrypted.len(), pcm.len());
+                                                                            pcm.len()
+                                                                        }
+                                                                        Err(e) => {
+                                                                            debug!("Failed to decode DAVE Opus: {}", e);
+                                                                            decrypted.len()
+                                                                        }
+                                                                    }
+                                                                } else {
+                                                                    decrypted.len()
+                                                                };
                                                                 let _ = state.event_tx.send(AppEvent::VoiceAudioFrame {
                                                                     guild_id: guild_id.get().to_string(),
                                                                     user_id: sender_user_id.to_string(),
                                                                     ssrc: header.ssrc,
-                                                                    samples: decrypted.len() / 2,
+                                                                    samples,
                                                                 });
                                                             }
                                                             Err(e) => {
-                                                                debug!("Failed to decrypt for user {}: {}", sender_user_id, e);
+                                                                // DAVE decryption failed — this user may not be E2EE-enabled.
+                                                                // Enable passthrough mode to receive transport-encrypted Opus.
+                                                                warn!("DAVE decrypt failed for user {}: {} — enabling passthrough mode", sender_user_id, e);
+                                                                session.set_passthrough_mode(true);
+                                                                // Fall through to passthrough decode below
+                                                                let opus_data = if payload.len() > 4 {
+                                                                    &payload[..payload.len() - 4]
+                                                                } else {
+                                                                    payload
+                                                                };
+                                                                let samples = if let Some(decoder) = opus_decoder.as_mut() {
+                                                                    match decoder.decode(opus_data) {
+                                                                        Ok(pcm) => {
+                                                                            debug!("Decoded passthrough Opus: {} bytes -> {} PCM samples", opus_data.len(), pcm.len());
+                                                                            pcm.len()
+                                                                        }
+                                                                        Err(e) => {
+                                                                            debug!("Failed to decode passthrough Opus: {}", e);
+                                                                            0
+                                                                        }
+                                                                    }
+                                                                } else {
+                                                                    opus_data.len()
+                                                                };
+                                                                let _ = state.event_tx.send(AppEvent::VoiceAudioFrame {
+                                                                    guild_id: guild_id.get().to_string(),
+                                                                    user_id: sender_user_id.to_string(),
+                                                                    ssrc: header.ssrc,
+                                                                    samples,
+                                                                });
                                                             }
                                                         }
                                                     } else {
@@ -341,7 +410,7 @@ impl DaveyVoiceEngine {
                                         }
                                     }
                                     Err(e) => {
-                                        debug!("Failed to parse RTP header: {}", e);
+                                        warn!("Failed to parse RTP header: {}", e);
                                     }
                                 }
                             }
@@ -349,7 +418,12 @@ impl DaveyVoiceEngine {
                                 // No data available
                             }
                             Err(e) => {
-                                debug!("UDP recv error: {}", e);
+                                // UDP recv errors are expected (timeout, would_block) — only warn on persistent errors
+                                static UDP_ERROR_COUNT: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+                                let count = UDP_ERROR_COUNT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                                if count < 5 || count % 100 == 0 {
+                                    warn!("UDP recv error (count={}): {}", count + 1, e);
+                                }
                             }
                         }
                     }
@@ -472,8 +546,23 @@ impl DaveyVoiceEngine {
                             });
                         }
                         Ok(VoiceEvent::Hello { heartbeat_interval: hi }) => {
-                            heartbeat_interval = tokio::time::interval(Duration::from_millis(hi));
-                            heartbeat_interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+                            // Add jitter: Discord sends heartbeat_interval, we should add 0-50% jitter
+                            // to avoid thundering herd. Discord already adds jitter to Hello timing.
+                            let jitter_ms = (hi as f64 * 0.25) as u64;
+                            let actual_interval = hi + (jitter_ms % hi);
+                            heartbeat_interval = tokio::time::interval(Duration::from_millis(actual_interval));
+                            heartbeat_interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+                            heartbeat_pending = false;
+                            last_heartbeat_ack = std::time::Instant::now();
+                            consecutive_missed_acks = 0;
+                            info!("Voice Hello: heartbeat_interval={}ms (with jitter: {}ms)", hi, actual_interval);
+                        }
+                        Ok(VoiceEvent::HeartbeatAck) => {
+                            last_heartbeat_ack = std::time::Instant::now();
+                            if consecutive_missed_acks > 0 {
+                                info!("Heartbeat ACK recovered after {} missed", consecutive_missed_acks);
+                            }
+                            consecutive_missed_acks = 0;
                         }
                         Ok(VoiceEvent::DaveMlsExternalSender { external_sender_package }) => {
                             debug!("Received DAVE MLS External Sender: {} bytes", external_sender_package.len());
@@ -826,8 +915,8 @@ impl DaveyVoiceEngine {
                 }
             }
 
-            // Reconnect to voice gateway
-            match VoiceGateway::connect(
+            // Try resume first, then fall back to full reconnect
+            let mut gateway = match VoiceGateway::connect(
                 &endpoint,
                 session_id.clone(),
                 token.clone(),
@@ -835,69 +924,155 @@ impl DaveyVoiceEngine {
                 bot_user_id.to_string(),
                 dave::MAX_DAVE_PROTOCOL_VERSION,
             ).await {
-                Ok(gateway) => {
-                    info!("Reconnected to voice gateway");
-                    state.record_voice_signal_trace(VoiceSignalTrace {
-                        guild_id: guild_id.get().to_string(),
-                        stage: "reconnect_success".to_string(),
-                        message: format!("attempt={}", reconnect_attempt),
-                        user_id: None,
-                        channel_id: Some(channel_id.get().to_string()),
-                        ssrc: None,
-                    }).await;
+                Ok(mut gw) => {
+                    // Try resume on the new connection
+                    if let Err(e) = gw.resume().await {
+                        warn!("Resume failed, will do full reconnect: {}", e);
+                        None
+                    } else {
+                        info!("Voice gateway resume sent");
+                        Some(gw)
+                    }
+                }
+                Err(e) => {
+                    warn!("Failed to connect for resume: {}", e);
+                    None
+                }
+            };
 
-                    // Reset reconnect counter on successful connection
-                    reconnect_attempt = 0;
+            // If resume failed, do full reconnect by requesting fresh voice events
+            if gateway.is_none() {
+                // Request fresh voice state update from Discord
+                let voice_state_update = UpdateVoiceState::new(guild_id, Some(channel_id), false, false);
+                let _ = state.bot.gateway.command(&voice_state_update);
+                info!(guild_id = %guild_id.get(), "Sent fresh Voice State Update for reconnect");
 
-                    // Clone shutdown receiver for the inner loop
-                    let inner_shutdown = shutdown_rx.clone();
-                    let inner_audio = audio_rx.resubscribe();
+                // Wait for new voice events via event subscription
+                let mut rx = state.event_tx.subscribe();
+                let guild_id_str = guild_id.get().to_string();
+                let mut new_session_id: Option<String> = None;
+                let mut new_token: Option<String> = None;
+                let mut new_endpoint: Option<String> = None;
+                let _ = &mut new_session_id;
+                let _ = &mut new_token;
+                let _ = &mut new_endpoint;
 
-                    // Run the voice loop
-                    let reason = Self::run_voice_loop_inner(
-                        gateway,
-                        state.clone(),
-                        guild_id,
-                        channel_id,
-                        bot_user_id,
-                        inner_shutdown,
-                        inner_audio,
-                    ).await;
+                let timeout = tokio::time::sleep(Duration::from_secs(15));
+                tokio::pin!(timeout);
 
-                    match reason {
-                        DisconnectReason::NormalClose => {
-                            info!("Voice loop ended normally");
-                            return;
-                        }
-                        DisconnectReason::Fatal(msg) => {
-                            error!("Fatal voice error: {}", msg);
+                loop {
+                    tokio::select! {
+                        _ = &mut timeout => {
+                            warn!("Timed out waiting for fresh voice events for reconnect");
                             state.record_voice_signal_trace(VoiceSignalTrace {
                                 guild_id: guild_id.get().to_string(),
-                                stage: "reconnect_fatal".to_string(),
-                                message: msg,
+                                stage: "reconnect_failed".to_string(),
+                                message: format!("attempt={}, error=timeout waiting for fresh voice events", reconnect_attempt),
                                 user_id: None,
                                 channel_id: Some(channel_id.get().to_string()),
                                 ssrc: None,
                             }).await;
-                            return;
-                        }
-                        _ => {
-                            warn!("Voice loop ended with {:?}, will reconnect", reason);
                             reconnect_attempt += 1;
+                            continue;
+                        }
+                        event = rx.recv() => {
+                            match event {
+                                Ok(AppEvent::VoiceSessionReady { guild_id: gid, session_id: sid, token: t, endpoint: e }) => {
+                                    if gid == guild_id_str {
+                                        new_session_id = Some(sid);
+                                        new_token = Some(t);
+                                        new_endpoint = Some(e);
+                                        break;
+                                    }
+                                }
+                                Ok(_) => continue,
+                                Err(_) => {
+                                    warn!("Event channel closed during reconnect");
+                                    return;
+                                }
+                            }
                         }
                     }
                 }
-                Err(e) => {
-                    warn!("Failed to reconnect to voice gateway: {}", e);
-                    state.record_voice_signal_trace(VoiceSignalTrace {
-                        guild_id: guild_id.get().to_string(),
-                        stage: "reconnect_failed".to_string(),
-                        message: format!("attempt={}, error={}", reconnect_attempt, e),
-                        user_id: None,
-                        channel_id: Some(channel_id.get().to_string()),
-                        ssrc: None,
-                    }).await;
-                    reconnect_attempt += 1;
+
+                if let (Some(new_session_id), Some(new_token), Some(new_endpoint)) = (new_session_id, new_token, new_endpoint) {
+                    info!("Got fresh voice info for reconnect: session_id={}", new_session_id);
+                    gateway = match VoiceGateway::connect(
+                        &new_endpoint,
+                        new_session_id,
+                        new_token,
+                        guild_id.get().to_string(),
+                        bot_user_id.to_string(),
+                        dave::MAX_DAVE_PROTOCOL_VERSION,
+                    ).await {
+                        Ok(gw) => Some(gw),
+                        Err(e) => {
+                            warn!("Failed to reconnect to voice gateway: {}", e);
+                            state.record_voice_signal_trace(VoiceSignalTrace {
+                                guild_id: guild_id.get().to_string(),
+                                stage: "reconnect_failed".to_string(),
+                                message: format!("attempt={}, error={}", reconnect_attempt, e),
+                                user_id: None,
+                                channel_id: Some(channel_id.get().to_string()),
+                                ssrc: None,
+                            }).await;
+                            reconnect_attempt += 1;
+                            continue;
+                        }
+                    };
+                }
+            }
+
+            if let Some(gateway) = gateway {
+                info!("Reconnected to voice gateway");
+                state.record_voice_signal_trace(VoiceSignalTrace {
+                    guild_id: guild_id.get().to_string(),
+                    stage: "reconnect_success".to_string(),
+                    message: format!("attempt={}", reconnect_attempt),
+                    user_id: None,
+                    channel_id: Some(channel_id.get().to_string()),
+                    ssrc: None,
+                }).await;
+
+                // Reset reconnect counter on successful connection
+                reconnect_attempt = 0;
+
+                // Clone shutdown receiver for the inner loop
+                let inner_shutdown = shutdown_rx.clone();
+                let inner_audio = audio_rx.resubscribe();
+
+                // Run the voice loop
+                let reason = Self::run_voice_loop_inner(
+                    gateway,
+                    state.clone(),
+                    guild_id,
+                    channel_id,
+                    bot_user_id,
+                    inner_shutdown,
+                    inner_audio,
+                ).await;
+
+                match reason {
+                    DisconnectReason::NormalClose => {
+                        info!("Voice loop ended normally");
+                        return;
+                    }
+                    DisconnectReason::Fatal(msg) => {
+                        error!("Fatal voice error: {}", msg);
+                        state.record_voice_signal_trace(VoiceSignalTrace {
+                            guild_id: guild_id.get().to_string(),
+                            stage: "reconnect_fatal".to_string(),
+                            message: msg,
+                            user_id: None,
+                            channel_id: Some(channel_id.get().to_string()),
+                            ssrc: None,
+                        }).await;
+                        return;
+                    }
+                    _ => {
+                        warn!("Voice loop ended with {:?}, will reconnect", reason);
+                        reconnect_attempt += 1;
+                    }
                 }
             }
         }

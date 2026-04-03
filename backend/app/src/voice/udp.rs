@@ -453,3 +453,129 @@ impl OpusDecoder {
         vec![0i16; 960]
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_rtp_header_minimal_parse() {
+        // Standard RTP header: V=2, P=0, X=0, CC=0, M=0, PT=0x78 (Opus)
+        let data: Vec<u8> = vec![
+            0x80, // V=2, P=0, X=0, CC=0
+            0x78, // M=0, PT=0x78
+            0x00, 0x01, // sequence = 1
+            0x00, 0x00, 0x00, 0x00, // timestamp = 0
+            0x00, 0x00, 0x00, 0x01, // ssrc = 1
+        ];
+
+        let (header, offset) = RtpHeader::parse(&data).unwrap();
+        assert_eq!(header.version, 2);
+        assert!(!header.padding);
+        assert!(!header.extension);
+        assert_eq!(header.csrc_count, 0);
+        assert!(!header.marker);
+        assert_eq!(header.payload_type, 0x78);
+        assert_eq!(header.sequence, 1);
+        assert_eq!(header.timestamp, 0);
+        assert_eq!(header.ssrc, 1);
+        assert!(header.csrcs.is_empty());
+        assert_eq!(offset, 12);
+    }
+
+    #[test]
+    fn test_rtp_header_serialize_roundtrip() {
+        let original = RtpHeader {
+            version: 2,
+            padding: false,
+            extension: false,
+            csrc_count: 0,
+            marker: true,
+            payload_type: 0x78,
+            sequence: 12345,
+            timestamp: 960,
+            ssrc: 42,
+            csrcs: vec![],
+        };
+
+        let serialized = original.serialize();
+        let (parsed, offset) = RtpHeader::parse(&serialized).unwrap();
+
+        assert_eq!(parsed.version, original.version);
+        assert_eq!(parsed.marker, original.marker);
+        assert_eq!(parsed.payload_type, original.payload_type);
+        assert_eq!(parsed.sequence, original.sequence);
+        assert_eq!(parsed.timestamp, original.timestamp);
+        assert_eq!(parsed.ssrc, original.ssrc);
+        assert_eq!(offset, 12);
+    }
+
+    #[test]
+    fn test_rtp_header_with_csrc() {
+        let header = RtpHeader {
+            version: 2,
+            padding: false,
+            extension: false,
+            csrc_count: 2,
+            marker: false,
+            payload_type: 0x78,
+            sequence: 100,
+            timestamp: 48000,
+            ssrc: 1,
+            csrcs: vec![10, 20],
+        };
+
+        let serialized = header.serialize();
+        assert_eq!(serialized.len(), 12 + 2 * 4); // 12 + CC*4
+
+        let (parsed, offset) = RtpHeader::parse(&serialized).unwrap();
+        assert_eq!(parsed.csrc_count, 2);
+        assert_eq!(parsed.csrcs, vec![10, 20]);
+        assert_eq!(offset, 20);
+    }
+
+    #[test]
+    fn test_rtp_header_too_short() {
+        let data: Vec<u8> = vec![0x80, 0x78, 0x00, 0x01];
+        assert!(RtpHeader::parse(&data).is_err());
+    }
+
+    #[test]
+    fn test_rtp_header_with_extension() {
+        // V=2, X=1, CC=0
+        let data: Vec<u8> = vec![
+            0x90, // V=2, X=1
+            0x78, // M=0, PT=0x78
+            0x00, 0x01, // sequence = 1
+            0x00, 0x00, 0x00, 0x00, // timestamp = 0
+            0x00, 0x00, 0x00, 0x01, // ssrc = 1
+            0xBE, 0xDE, // extension profile (RFC 5285 one-byte header)
+            0x00, 0x01, // extension length = 1 (4 bytes)
+            0x00, 0x00, 0x00, 0x00, // extension data
+        ];
+
+        let (header, offset) = RtpHeader::parse(&data).unwrap();
+        assert!(header.extension);
+        assert_eq!(offset, 20); // 12 + 4 (ext header) + 4 (ext data)
+    }
+
+    #[test]
+    fn test_rtp_header_opus_voice() {
+        // Realistic Discord voice RTP header
+        let data: Vec<u8> = vec![
+            0x80, // V=2
+            0x78, // PT=Opus (120)
+            0x00, 0x42, // sequence = 66
+            0x00, 0x00, 0x03, 0xC0, // timestamp = 960
+            0x00, 0x01, 0x02, 0x03, // ssrc
+        ];
+
+        let (header, offset) = RtpHeader::parse(&data).unwrap();
+        assert_eq!(header.version, 2);
+        assert_eq!(header.payload_type, 0x78);
+        assert_eq!(header.sequence, 66);
+        assert_eq!(header.timestamp, 960);
+        assert_eq!(header.ssrc, 0x00010203);
+        assert_eq!(offset, 12);
+    }
+}

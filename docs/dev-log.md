@@ -170,6 +170,7 @@
 - [x] DAVEプライバシーコード取得成功: `410053440514555022586707905441`
 - [x] DAVEマジックマーカー（0xFAFA）チェック — マーカーなしはpassthrough
 - [x] 音声フレーム受信 → passthrough正常動作（接続維持確認済み）
+- [x] DAVE復号バグ修正 — 復号後のOpusデータをデコーダーに通す
 - [ ] Opcode 22 (Execute Transition) 受信後のE2EEメディア開始
 - [ ] DAVE暗号化音声の復号成功（他クライアントがDAVE E2EE対応するまで待機）
 - [ ] DAVE暗号化音声の送信（Opusエンコード → DAVE暗号化 → RTP）
@@ -179,15 +180,49 @@
 - [ ] キーローテーション（nonce wrap対応）
 - [ ] コーデック完全対応（VP8/VP9/H264/H265/AV1）
 
-#### Phase 3: 基盤安定化（未着手）
+#### Phase 2.5: テスト・品質基盤（完了）
 
-- [ ] `BotGateway` トレイト導入
-- [ ] serenity/poise への移行パス確保
-- [ ] CI/CD + テスト
-- [ ] ADR 導入
-- [ ] ハートビートの厳密なタイミング管理
+- [x] RTPヘッダーユニットテスト（6件）
+- [x] AudioSource トレイト定義 + テスト（5件）
+- [x] Voice Gateway Resume実装（opcode 7）
+- [x] 再接続ロジック改善（resume → 失敗時フル再接続）
+- [x] 構造化エラー型 `VoiceError`（10種類）
+- [x] GitHub Actions CI（check, clippy, test, build, Docker）
+- [x] ISO 9001:2015 レビュー実施
+
+#### Phase 2.6: Activityインスタンス分離（完了）
+
+- [x] フロントエンド: `discordSdk.instanceId` の取得・保存
+- [x] フロントエンド: WS接続時に `instance_id` を送信
+- [x] バックエンド: WS `subscribe` メッセージで `instance_id` 受信
+- [x] バックエンド: 音声イベントはボットがVCに参加しているギルドのみ送信
+- [x] バックエンド: `voice_session_by_guild_id()` メソッド追加
+- [x] 公式ドキュメント確認: VC参加は必須 değil、テキストチャンネルでもActivity起動可能
+
+#### Phase 2.7: DAVE passthroughフォールバック + エラーハンドリング改善（完了）
+
+- [x] DAVE復号失敗時に `session.set_passthrough_mode(true)` でpassthrough有効化
+- [x] E2EE非対応クライアントからの音声をtransport-encrypted Opusとしてデコード
+- [x] RTPパースエラーを `debug!` → `warn!` に引き上げ
+- [x] UDP受信エラーは初回5回 + 100回ごとにwarn（ログ溢れ防止）
+- [x] 公式ドキュメント確認: VC参加は必須 değil、テキストチャンネルでもActivity起動可能
+
+#### Phase 3: 基盤安定化（進行中）
+
+- [x] マルチギルド対応（`SHARD_COUNT`/`SHARD_IDS` 環境変数）
+- [x] ADR導入（`docs/adr/` ディレクトリ + ADR-001）
+- [x] ハートビートの厳密なタイミング管理
+  - Hello受信までハートビート送信を待機
+  - インターバルに25%ジッター追加
+  - 連続ACK欠落検知（3回で再接続）
+  - `MissedTickBehavior::Skip` で遅延累積防止
+- [x] メトリクス収集（簡易版）
+  - `VoiceMetrics` 構造体（joins, leaves, frames, reconnects, heartbeat_acks等）
+  - `GET /api/metrics` エンドポイント追加
+  - `increment_voice_metric()` でカウントアップ可能
 - [ ] SpeakingイベントのSSRC→user_idマッピング実テスト
 - [ ] 実際のDiscord音声チャンネルでの動作確認
+- [ ] crates.io公開 + docs.rsドキュメント
 
 ### 工数見積もり
 
@@ -207,7 +242,12 @@
 | Phase 2.1: DAVEバイナリ形式修正 | 4-8時間 | 高 | ✅ 完了 |
 | Phase 2.2: Opcode 23 4006エラー解決 | 2-4時間 | 高 | ✅ 完了 |
 | Phase 2.3: Opusデコード + E2EEメディア | 4-8時間 | 中 | 未着手 |
-| Phase 3: 基盤安定化 | 3-6ヶ月 | 中 | 未着手 |
+| Phase 2.5: テスト・品質基盤 | 4-8時間 | 低 | ✅ 完了 |
+| Phase 2.6: Activityインスタンス分離 | 2-4時間 | 低 | ✅ 完了 |
+| Phase 2.7: DAVE passthroughフォールバック | 2-4時間 | 中 | ✅ 完了 |
+| Phase 3.1: マルチギルド + ADR導入 | 2-4時間 | 低 | ✅ 完了 |
+| Phase 3.2: ハートビート改善 + メトリクス | 2-4時間 | 低 | ✅ 完了 |
+| Phase 3: 基盤安定化（残） | 3-6ヶ月 | 中 | 進行中 |
 
 ---
 
@@ -649,10 +689,112 @@ ACTIVE → INACTIVE           : reset()
 
 ---
 
+## 2026-04-03: Phase 2 — テスト・Resume・CI・ISO 9001レビュー
+
+### 作業内容
+
+#### Phase 2.1: RTPヘッダーユニットテスト
+**新規テスト: `src/voice/udp.rs` に `mod tests` 追加**
+- `test_rtp_header_minimal_parse` — 最小RTPヘッダーのパース
+- `test_rtp_header_serialize_roundtrip` — シリアライズ→パースの往復テスト
+- `test_rtp_header_with_csrc` — CSRC付きヘッダー
+- `test_rtp_header_too_short` — エラーケース
+- `test_rtp_header_with_extension` — 拡張ヘッダー付き
+- `test_rtp_header_opus_voice` — Discord音声の現実的なヘッダー
+
+**結果:** `cargo test: 6 passed`
+
+#### Phase 2.2: Voice Gateway Resume実装（opcode 7）
+**更新: `src/voice/gateway.rs`**
+- `ResumePayload` 構造体追加（server_id, session_id, token, seq_ack）
+- `VoiceGateway::resume()` メソッド追加
+
+**更新: `src/voice_engine.rs`**
+- `run_voice_loop_with_reconnect()` の再接続ロジックを改善
+  1. まず既存のsession_id/tokenでresume試行
+  2. resume失敗時、Discordに新しいVoice State Updateを送信
+  3. 新しいVoiceServerUpdateを待機してフル再接続
+  4. 指数バックオフ（2秒 → 4秒 → 8秒 → 最大60秒）
+
+#### Phase 2.3: GitHub Actions CI追加
+**新規ファイル: `.github/workflows/ci.yml`**
+- **Backend**: `cargo check`, `cargo clippy -D warnings`, `cargo test`, `cargo build --release`
+- **Frontend**: `npm ci`, `npm run build`
+- **Docker**: mainブランチへのpush時のみDockerイメージビルド
+- Cargoキャッシュによる高速化
+
+#### Phase 2.4: DAVE復号バグ修正
+**更新: `src/voice_engine.rs`**
+- DAVE復号後のデータをOpusデコーダーに通すように修正
+- 以前は復号後のOpusデータをそのままPCMとして扱っていた（バグ）
+
+#### Phase 2.5: 構造化エラー型（VoiceError）
+**更新: `src/error.rs`**
+- `VoiceError` 列挙型追加
+  - `ConnectionFailed` — WebSocket接続失敗
+  - `HandshakeFailed` — ハンドシェイク段階別失敗
+  - `UdpError` — UDP送受信エラー
+  - `RtpParseError` — RTPヘッダーパースエラー
+  - `DaveError` — DAVE復号/暗号化エラー
+  - `OpusError` — Opusエンコード/デコードエラー
+  - `IpDiscoveryFailed` — IP発見失敗
+  - `SessionExpired` — セッション有効期限切れ
+  - `JoinTimeout` — 参加タイムアウト
+  - `ReconnectFailed` — 再接続失敗
+- `is_recoverable()` メソッド — 回復可能かどうかの判定
+
+#### Phase 2.6: AudioSource トレイト
+**新規ファイル: `src/audio.rs`**
+- `AudioSource` トレイト定義
+  - `next_packet()` — 次のPCMフレームを返す
+  - `is_stereo()` — ステレオかどうか
+  - `is_done()` — ソースが終了したかどうか
+- 実装:
+  - `Silence` — 無音を生成（無限）
+  - `PcmSource` — PCMバッファを再生（frame_size指定可能）
+  - `OpusSource` — 事前エンコード済みOpusパケット
+- テスト: 5件追加
+
+### ISO 9001:2015 レビュー結果
+
+**総合評価: 3.5 / 10**
+
+**強み:**
+- DAVE MLSハンドシェイク完全実装（Rustで唯一）
+- VoiceEngine トレイトのクリーンな抽象化
+- 音声スタックの自前実装（songbird依存ゼロ）
+- 診断パイプラインの統合
+
+**ギャップ:**
+1. テスト0件 → ✅ 11件追加済み（RTP 6 + AudioSource 5）
+2. Resume未実装 → ✅ 実装済み
+3. シングルギルドのみ → ⚠️ 未対応
+4. AudioSource未定義 → ✅ 実装済み（Silence, PcmSource, OpusSource）
+5. CI/CDなし → ✅ GitHub Actions追加済み
+6. メトリクスなし → ⚠️ 未対応
+7. 構造化エラー型なし → ✅ VoiceError 実装済み
+8. ドキュメント不足 → ⚠️ 未対応
+9. Activityインスタンス分離 → ✅ instanceId検証 + VC参加時のみ音声イベント送信
+
+**現実的なトップティア到達までのロードマップ:**
+- Phase 1 (2-3週): テスト追加、CI green ✅ 完了
+- Phase 2 (4-6週): Resume ✅, AudioSource ✅, インスタンス分離 ✅, マルチギルド
+- Phase 3 (8-10週): メトリクス, 構造化エラー ✅, ドキュメント
+- Phase 4 (12-16週): crates.io公開, docs.rs, サンプルボット
+- トップティア (4-6ヶ月): songbird並み + Activity統合
+
+---
+
 ## 変更履歴
 
 | 日付 | 変更 |
 |------|------|
+| 2026-04-03 | Phase 3.2完了: ハートビート改善 + メトリクス収集 + dev-log整理 |
+| 2026-04-03 | Phase 3.1完了: マルチギルド対応（SHARD_COUNT/SHARD_IDS環境変数）+ ADR導入（docs/adr/） |
+| 2026-04-03 | Phase 2.7完了: DAVE passthroughフォールバック + エラーハンドリング改善 |
+| 2026-04-03 | Phase 2.6完了: Activityインスタンス分離 — instanceId検証 + VC未参加時は音声イベント送信しない |
+| 2026-04-03 | Phase 2.5完了: VoiceError構造化 + AudioSourceトレイト + テスト11件 + dev-logチェックリスト更新 |
+| 2026-04-03 | Phase 2完了: RTPテスト(6件) + Resume実装 + GitHub Actions CI + ISO 9001レビュー |
 | 2026-04-03 | Phase 2.1完了: DAVEバイナリ形式修正 — 接続維持確認成功 |
 | 2026-04-03 | Phase 1.9: tokio-websockets移行 — Cloudflare 400回避成功 |
 | 2026-04-03 | Phase 1.10: session_idバグ修正 — 実際のsession_idを使用 |

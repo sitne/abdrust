@@ -19,6 +19,8 @@ pub struct Config {
     pub cors_allow_all: bool,
     pub cors_allowed_origins: Vec<HeaderValue>,
     pub activity_mode: ActivityMode,
+    pub shard_count: u32,
+    pub shard_ids: Vec<u32>,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -92,6 +94,28 @@ impl Config {
             })
             .transpose()?
             .unwrap_or_default();
+
+        // Shard configuration
+        let shard_count = env::var("SHARD_COUNT")
+            .ok()
+            .map(|v| v.parse::<u32>())
+            .transpose()
+            .context("SHARD_COUNT must be a number")?
+            .unwrap_or(1);
+
+        let shard_ids = env::var("SHARD_IDS")
+            .ok()
+            .map(|v| {
+                v.split(',')
+                    .map(str::trim)
+                    .filter(|s| !s.is_empty())
+                    .map(|s| s.parse::<u32>())
+                    .collect::<Result<Vec<_>, _>>()
+            })
+            .transpose()
+            .context("SHARD_IDS must be comma-separated numbers")?
+            .unwrap_or_else(|| (0..shard_count).collect());
+
         Ok(Self {
             discord_token,
             discord_client_id,
@@ -104,6 +128,8 @@ impl Config {
             cors_allow_all,
             cors_allowed_origins,
             activity_mode,
+            shard_count,
+            shard_ids,
         })
     }
 }

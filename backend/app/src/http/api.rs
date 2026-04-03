@@ -34,3 +34,18 @@ pub async fn voice_private(State(state): State<AppState>, headers: HeaderMap, Pa
         "receive_trace": diagnostics.receive_trace,
     })))
 }
+
+pub async fn metrics(State(state): State<AppState>) -> Result<Json<serde_json::Value>, AppError> {
+    let metrics = state.voice_metrics().await;
+    Ok(Json(json!({
+        "total_joins": metrics.total_joins,
+        "total_leaves": metrics.total_leaves,
+        "total_voice_frames": metrics.total_voice_frames,
+        "total_dave_decrypted": metrics.total_dave_decrypted,
+        "total_passthrough_frames": metrics.total_passthrough_frames,
+        "total_reconnects": metrics.total_reconnects,
+        "total_heartbeat_acks": metrics.total_heartbeat_acks,
+        "total_heartbeat_timeouts": metrics.total_heartbeat_timeouts,
+        "current_active_connections": metrics.current_active_connections,
+    })))
+}
