@@ -1,8 +1,7 @@
 use anyhow::Result;
-use abdrust::{bot, config::Config, http, state::AppState, voice_engine::SongbirdVoiceEngine};
+use abdrust::{bot, config::Config, http, state::AppState, voice_engine::DaveyVoiceEngine};
 use abdrust::dave;
-use songbird::{driver::{Channels, DecodeConfig, DecodeMode, SampleRate}, shards::TwilightMap, Songbird};
-use std::{collections::HashMap, sync::Arc};
+use std::sync::Arc;
 use tokio::signal;
 use tracing_subscriber::EnvFilter;
 use twilight_gateway::{Intents, Shard, ShardId};
@@ -17,21 +16,9 @@ async fn main() -> Result<()> {
     let shard = Shard::new(ShardId::ONE, config.discord_token.clone(), Intents::GUILDS | Intents::GUILD_MEMBERS | Intents::GUILD_VOICE_STATES | Intents::GUILD_MESSAGES);
     let bot_user_id = http.current_user().await?.model().await?.id;
 
-    let shard_sender = shard.sender();
-    let mut map = HashMap::new();
-    map.insert(ShardId::ONE.number(), shard_sender);
-    let twilight_map = TwilightMap::new(map);
-    let songbird = Songbird::twilight(Arc::new(twilight_map), bot_user_id);
-    songbird.set_config(
-        songbird::Config::default()
-            .decode_mode(DecodeMode::Decode(DecodeConfig::new(Channels::Mono, SampleRate::Hz48000)))
-            .use_softclip(true),
-    );
-
-    let songbird = Arc::new(songbird);
-    let voice_engine = Arc::new(SongbirdVoiceEngine::new(songbird.clone()));
-    tracing::info!(dave_protocol_version = dave::MAX_DAVE_PROTOCOL_VERSION, "DAVE support available");
-    let state = AppState::new(config.clone(), Arc::new(http), voice_engine);
+    let voice_engine = Arc::new(DaveyVoiceEngine::new(bot_user_id));
+    tracing::info!(dave_protocol_version = dave::MAX_DAVE_PROTOCOL_VERSION, "DAVE support available (handshake in progress)");
+    let state = AppState::new(config.clone(), Arc::new(http), shard.sender(), bot_user_id, voice_engine);
 
     let bot_state = state.clone();
     tokio::spawn(async move {

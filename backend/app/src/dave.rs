@@ -1,7 +1,6 @@
 use crate::state::VoiceCapabilities;
-use songbird::error::JoinError;
 
-pub const ENGINE_NAME: &str = "songbird+davey";
+pub const ENGINE_NAME: &str = "davey";
 pub const MAX_DAVE_PROTOCOL_VERSION: u16 = davey::DAVE_PROTOCOL_VERSION;
 pub const DAVE_FRAME_MARKER_BYTES: [u8; 2] = [0xFA, 0xFA];
 
@@ -21,7 +20,7 @@ pub const fn voice_capabilities(
     }
 }
 
-pub fn is_dave_required_join_error(err: &JoinError) -> bool {
+pub fn is_dave_required_error(err: &anyhow::Error) -> bool {
     let text = err.to_string();
     text.contains("4017") || text.contains("DAVE") || text.contains("E2EE")
 }

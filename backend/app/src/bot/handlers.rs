@@ -1,4 +1,4 @@
-use crate::{bot::commands::DEBUG_COMMAND_NAME, dave, state::{AppEvent, AppState, VoiceJoinState, VoiceSession}, voice};
+use crate::{bot::commands::DEBUG_COMMAND_NAME, presence, state::{AppEvent, AppState, VoiceJoinState, VoiceSession}, voice};
 use anyhow::Result;
 use twilight_model::{
     application::interaction::{InteractionData, InteractionType},
@@ -7,7 +7,9 @@ use twilight_model::{
 };
 
 pub async fn handle_interaction(state: AppState, event: &InteractionCreate) -> Result<()> {
+    tracing::info!(interaction_id = %event.id, kind = ?event.kind, "handling interaction");
     if event.kind != InteractionType::ApplicationCommand {
+        tracing::debug!("ignoring non-application-command interaction");
         return Ok(());
     }
 
@@ -37,13 +39,15 @@ pub async fn handle_interaction(state: AppState, event: &InteractionCreate) -> R
                 commands: vec![command.name.clone()],
                 voice_capabilities: state.voice_engine.voice_capabilities(),
             });
-            *state.ready_state.lock().await = Some(crate::state::BotReady {
+            let ready = crate::state::BotReady {
                 status: "command_invoked".to_string(),
                 application_id: event.application_id.get().to_string(),
                 guild_id: command.guild_id.map(|id| id.get().to_string()),
                 commands: vec![command.name.clone()],
                 voice_capabilities: state.voice_engine.voice_capabilities(),
-            });
+            };
+            presence::send_ready(&state.bot.gateway, &ready);
+            *state.ready_state.lock().await = Some(ready);
 
             state
                 .bot
@@ -106,63 +110,36 @@ async fn handle_voice_command(state: AppState, event: &InteractionCreate, comman
                         },
                     )
                     .await;
+                presence::send_status(&state.bot.gateway, "joining voice channel");
 
                 let state_clone = state.clone();
                 let token = event.token.clone();
                 let application_id = event.application_id;
                 tokio::spawn(async move {
                     let result = voice::join_voice(&state_clone, guild_id, channel_id).await;
-                    let failure_kind = result.as_ref().err().map(voice::classify_join_error);
-                    let dave_required = result
-                        .as_ref()
-                        .err()
-                        .is_some_and(dave::is_dave_required_join_error);
                     let (content, causes) = match result {
-                        Ok(_) => ("✅ voice joined".to_string(), Vec::new()),
+                        Ok(_) => ("✅ voice joined (placeholder; DAVE handshake pending)".to_string(), Vec::new()),
                         Err(err) => {
-                            let causes = voice::join_error_causes(&err);
-                            let detail = voice::describe_join_error(&err);
-                            (format!("❌ {}", detail), causes)
+                            let causes = vec![err.to_string()];
+                            (format!("❌ voice join failed: {err}"), causes)
                         }
                     };
                     if !causes.is_empty() {
                         tracing::warn!(
                             guild_id = %guild_id.get(),
                             user_id = %user_id.get(),
-                            failure_kind = ?failure_kind,
                             causes = ?causes,
                             "voice join failed"
                         );
-                        if dave_required || matches!(failure_kind, Some(voice::JoinFailureKind::RequiresDave)) {
-                            tracing::error!(
-                                guild_id = %guild_id.get(),
-                                user_id = %user_id.get(),
-                                "voice channel requires DAVE/E2EE support"
-                            );
-                        }
-                        let join_state = if dave_required || matches!(failure_kind, Some(voice::JoinFailureKind::RequiresDave)) {
-                            let capabilities = state_clone.voice_engine.voice_capabilities();
-                            VoiceJoinState::Unsupported {
-                                guild_id: guild_id.get().to_string(),
-                                user_id: user_id.get().to_string(),
-                                channel_id: channel_id.get().to_string(),
-                                message: content.clone(),
-                                failure_kind: failure_kind.map(|kind| kind.label().to_string()).unwrap_or_else(|| "Other".to_string()),
-                                causes: causes.clone(),
-                                dave_required: true,
-                                engine_name: capabilities.engine_name.to_string(),
-                                max_dave_protocol_version: capabilities.max_dave_protocol_version,
-                            }
-                        } else {
-                            VoiceJoinState::Failed {
-                                guild_id: guild_id.get().to_string(),
-                                user_id: user_id.get().to_string(),
-                                channel_id: channel_id.get().to_string(),
-                                message: content.clone(),
-                                causes: causes.clone(),
-                            }
+                        let join_state = VoiceJoinState::Failed {
+                            guild_id: guild_id.get().to_string(),
+                            user_id: user_id.get().to_string(),
+                            channel_id: channel_id.get().to_string(),
+                            message: content.clone(),
+                            causes: causes.clone(),
                         };
                         state_clone.set_voice_join_state(guild_id, join_state).await;
+                        presence::send_status(&state_clone.bot.gateway, "voice disconnected");
                         let _ = state_clone.event_tx.send(AppEvent::Custom {
                             name: "voice_join_error".to_string(),
                             payload: serde_json::json!({
@@ -170,7 +147,7 @@ async fn handle_voice_command(state: AppState, event: &InteractionCreate, comman
                                 "user_id": user_id.get().to_string(),
                                 "message": content,
                                 "causes": causes,
-                                "failure_kind": failure_kind.map(|kind| kind.label()),
+                                "failure_kind": "Other",
                             }),
                         });
                         let _ = state_clone.event_tx.send(AppEvent::VoiceJoinResult {
@@ -191,6 +168,7 @@ async fn handle_voice_command(state: AppState, event: &InteractionCreate, comman
                                 },
                             )
                             .await;
+                        presence::send_status(&state_clone.bot.gateway, "voice connected");
                         let _ = state_clone.event_tx.send(AppEvent::VoiceJoinResult {
                             guild_id: guild_id.get().to_string(),
                             user_id: user_id.get().to_string(),
@@ -213,6 +191,7 @@ async fn handle_voice_command(state: AppState, event: &InteractionCreate, comman
         }
         "leave" => {
             voice::leave_voice(&state, guild_id).await?;
+            presence::send_status(&state.bot.gateway, "voice disconnected");
             "✅ voice left".to_string()
         }
         "status" => {

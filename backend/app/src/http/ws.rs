@@ -125,6 +125,7 @@ fn should_forward(subscribed: &Option<String>, session_ok: bool, authorized_guil
         (Some(guild), AppEvent::VoiceJoinRequested { guild_id, .. }) => guild == guild_id && authorized_guilds.map(|allowed| allowed.iter().any(|id| id == guild_id)).unwrap_or(true),
         (Some(guild), AppEvent::VoiceJoinResult { guild_id, .. }) => guild == guild_id && authorized_guilds.map(|allowed| allowed.iter().any(|id| id == guild_id)).unwrap_or(true),
         (Some(guild), AppEvent::MessageCreate { guild_id, .. }) => guild == guild_id && authorized_guilds.map(|allowed| allowed.iter().any(|id| id == guild_id)).unwrap_or(true),
+        (Some(guild), AppEvent::VoiceSessionReady { guild_id, .. }) => guild == guild_id && authorized_guilds.map(|allowed| allowed.iter().any(|id| id == guild_id)).unwrap_or(true),
         (Some(_), AppEvent::Custom { .. }) => if auth_required { session_ok } else { true },
         (None, AppEvent::Custom { .. }) => if auth_required { session_ok } else { true },
         (None, _) => !auth_required,

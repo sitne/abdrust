@@ -6,4 +6,5 @@ pub mod bot;
 pub mod config;
 pub mod error;
 pub mod http;
+pub mod presence;
 pub mod state;

@@ -2,6 +2,7 @@ use crate::{auth::AuthSession, config::Config, voice_engine::VoiceEngine};
 use serde::Serialize;
 use std::{collections::HashMap, sync::Arc};
 use tokio::sync::{broadcast, Mutex};
+use twilight_gateway::MessageSender;
 use twilight_http::Client;
 use twilight_model::id::{
     marker::{ChannelMarker, GuildMarker, UserMarker},
@@ -21,6 +22,8 @@ pub struct AppState {
 
 pub struct BotState {
     pub http: Arc<Client>,
+    pub gateway: MessageSender,
+    pub bot_user_id: Id<UserMarker>,
     pub voice_sessions: Mutex<HashMap<Id<GuildMarker>, VoiceSession>>,
     pub user_voice_states: Mutex<HashMap<Id<GuildMarker>, HashMap<Id<UserMarker>, Id<ChannelMarker>>>>,
     pub voice_user_meta: Mutex<HashMap<Id<GuildMarker>, Arc<Mutex<HashMap<Id<UserMarker>, VoiceUserMeta>>>>>,
@@ -28,6 +31,15 @@ pub struct BotState {
     pub last_voice_receive_traces: Mutex<HashMap<String, VoiceReceiveTrace>>,
     pub last_voice_signal_traces: Mutex<HashMap<String, VoiceSignalTrace>>,
     pub auth_sessions: Mutex<HashMap<String, AuthSession>>,
+    pub bot_pending_session_id: Mutex<HashMap<Id<GuildMarker>, String>>,
+    pub pending_voice_info: Mutex<HashMap<Id<GuildMarker>, PendingVoiceInfo>>,
+}
+
+#[derive(Clone, Debug)]
+pub struct PendingVoiceInfo {
+    pub session_id: String,
+    pub token: String,
+    pub endpoint: String,
 }
 
 pub struct ActivityState {
@@ -99,6 +111,12 @@ pub enum AppEvent {
     Custom {
         name: String,
         payload: serde_json::Value,
+    },
+    VoiceSessionReady {
+        guild_id: String,
+        session_id: String,
+        token: String,
+        endpoint: String,
     },
 }
 
@@ -230,10 +248,12 @@ pub struct VoiceStreamUser {
 }
 
 impl AppState {
-    pub fn new(config: Config, http: Arc<Client>, voice_engine: Arc<dyn VoiceEngine>) -> Self {
+    pub fn new(config: Config, http: Arc<Client>, gateway: MessageSender, bot_user_id: Id<UserMarker>, voice_engine: Arc<dyn VoiceEngine>) -> Self {
         let config = Arc::new(config);
         let bot = Arc::new(BotState {
             http,
+            gateway,
+            bot_user_id,
             voice_sessions: Mutex::new(HashMap::new()),
             user_voice_states: Mutex::new(HashMap::new()),
             voice_user_meta: Mutex::new(HashMap::new()),
@@ -241,6 +261,8 @@ impl AppState {
             last_voice_receive_traces: Mutex::new(HashMap::new()),
             last_voice_signal_traces: Mutex::new(HashMap::new()),
             auth_sessions: Mutex::new(HashMap::new()),
+            pending_voice_info: Mutex::new(HashMap::new()),
+            bot_pending_session_id: Mutex::new(HashMap::new()),
         });
         let activity = Arc::new(Mutex::new(ActivityState {
             sessions: HashMap::new(),
@@ -354,6 +376,26 @@ impl AppState {
 
     pub async fn auth_session(&self, session_id: &str) -> Option<AuthSession> {
         self.bot.auth_sessions.lock().await.get(session_id).cloned()
+    }
+
+    pub async fn store_pending_voice_info(&self, guild_id: Id<GuildMarker>, token: String, endpoint: String) {
+        let session_id = self.user_voice_channel(guild_id, self.bot.bot_user_id)
+            .await
+            .map(|_| "active".to_string())
+            .unwrap_or_else(|| "pending".to_string());
+
+        self.bot.pending_voice_info.lock().await.insert(
+            guild_id,
+            PendingVoiceInfo {
+                session_id,
+                token,
+                endpoint,
+            },
+        );
+    }
+
+    pub async fn take_pending_voice_info(&self, guild_id: Id<GuildMarker>) -> Option<PendingVoiceInfo> {
+        self.bot.pending_voice_info.lock().await.remove(&guild_id)
     }
 
     pub async fn record_voice_receive_trace(&self, trace: VoiceReceiveTrace) {

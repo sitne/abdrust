@@ -1,4 +1,4 @@
-use crate::{bot::{commands, handlers}, state::AppState};
+use crate::{bot::{commands, handlers}, presence, state::AppState};
 use anyhow::Result;
 use twilight_gateway::{Event, EventTypeFlags, Shard, StreamExt};
 
@@ -9,10 +9,13 @@ pub async fn run(state: AppState, mut shard: Shard) -> Result<()> {
     register_slash_commands(&state).await?;
 
     while let Some(item) = shard.next_event(EventTypeFlags::all()).await {
-        match item? {
+        let event = item?;
+        tracing::debug!(event_type = ?event.kind(), "received gateway event");
+        match event {
             Event::InteractionCreate(i) => {
+                tracing::debug!(interaction_id = %i.id, interaction_type = ?i.kind, "received interaction");
                 if let Err(err) = handlers::handle_interaction(state.clone(), &i).await {
-                    tracing::warn!(error = %err, "interaction handler failed");
+                    tracing::error!(error = %err, "interaction handler failed");
                 }
             }
             Event::VoiceStateUpdate(v) => handlers::handle_voice_state_update(state.clone(), &v).await,
@@ -52,13 +55,16 @@ async fn register_slash_commands(state: &AppState) -> Result<()> {
         commands: names,
         voice_capabilities: state.voice_engine.voice_capabilities(),
     });
-    *state.ready_state.lock().await = Some(crate::state::BotReady {
+    let ready = crate::state::BotReady {
         status: "ready".to_string(),
         application_id: app_id.get().to_string(),
         guild_id: state.config.discord_guild_id.map(|id| id.get().to_string()),
         commands: commands.iter().map(|command| command.name.clone()).collect(),
         voice_capabilities: state.voice_engine.voice_capabilities(),
-    });
+    };
+    presence::send_ready(&state.bot.gateway, &ready);
+    presence::send_status(&state.bot.gateway, "ready");
+    *state.ready_state.lock().await = Some(ready);
 
     tracing::info!(count = commands.len(), "slash commands registered");
     Ok(())
