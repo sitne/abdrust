@@ -11,7 +11,7 @@ use crate::{
 };
 use anyhow::Result;
 use async_trait::async_trait;
-use crate::voice::udp::OpusEncoder;
+use crate::voice::udp::{OpusEncoder, OpusDecoder};
 use std::{
     collections::HashMap,
     net::SocketAddr,
@@ -194,6 +194,9 @@ impl DaveyVoiceEngine {
         // Opus encoder for sending audio
         let mut opus_encoder = OpusEncoder::new().ok();
 
+        // Opus decoder for receiving audio
+        let mut opus_decoder = OpusDecoder::new().ok();
+
         // Map SSRC -> user_id for decryption
         let ssrc_to_user: Arc<Mutex<HashMap<u32, u64>>> = Arc::new(Mutex::new(HashMap::new()));
 
@@ -232,38 +235,104 @@ impl DaveyVoiceEngine {
                                             let mut ds = dave_session.lock().await;
                                             if let Some(session) = ds.as_mut() {
                                                 if session.is_ready() {
-                                                    match session.decrypt(sender_user_id, payload) {
-                                                        Ok(decrypted) => {
-                                                            debug!("Decrypted audio: {} bytes for user {}", decrypted.len(), sender_user_id);
+                                                    // Check for DAVE magic marker (0xFAFA) at the end of the payload
+                                                    let has_dave_marker = payload.len() >= 2
+                                                        && payload[payload.len() - 2] == 0xFA
+                                                        && payload[payload.len() - 1] == 0xFA;
+
+                                                    if has_dave_marker {
+                                                        match session.decrypt(sender_user_id, payload) {
+                                                            Ok(decrypted) => {
+                                                                debug!("Decrypted audio: {} bytes for user {}", decrypted.len(), sender_user_id);
+                                                                let _ = state.event_tx.send(AppEvent::VoiceAudioFrame {
+                                                                    guild_id: guild_id.get().to_string(),
+                                                                    user_id: sender_user_id.to_string(),
+                                                                    ssrc: header.ssrc,
+                                                                    samples: decrypted.len() / 2,
+                                                                });
+                                                            }
+                                                            Err(e) => {
+                                                                debug!("Failed to decrypt for user {}: {}", sender_user_id, e);
+                                                            }
+                                                        }
+                                                    } else {
+                                                        // No DAVE marker - strip transport nonce (last 4 bytes) and decode as Opus
+                                                        let opus_data = if payload.len() > 4 {
+                                                            &payload[..payload.len() - 4]
+                                                        } else {
+                                                            payload
+                                                        };
+                                                        let samples = if let Some(decoder) = opus_decoder.as_mut() {
+                                                            match decoder.decode(opus_data) {
+                                                                Ok(pcm) => {
+                                                                    debug!("Decoded Opus (no DAVE): {} bytes (from {}) -> {} PCM samples", opus_data.len(), payload.len(), pcm.len());
+                                                                    let _ = state.event_tx.send(AppEvent::VoiceAudioFrame {
+                                                                        guild_id: guild_id.get().to_string(),
+                                                                        user_id: sender_user_id.to_string(),
+                                                                        ssrc: header.ssrc,
+                                                                        samples: pcm.len(),
+                                                                    });
+                                                                    pcm.len()
+                                                                }
+                                                                Err(e) => {
+                                                                    debug!("Failed to decode Opus (no DAVE): {}", e);
+                                                                    0
+                                                                }
+                                                            }
+                                                        } else {
+                                                            opus_data.len()
+                                                        };
+                                                        if samples == 0 && opus_decoder.is_none() {
                                                             let _ = state.event_tx.send(AppEvent::VoiceAudioFrame {
                                                                 guild_id: guild_id.get().to_string(),
                                                                 user_id: sender_user_id.to_string(),
                                                                 ssrc: header.ssrc,
-                                                                samples: decrypted.len() / 2, // i16 samples
+                                                                samples: opus_data.len(),
                                                             });
-                                                        }
-                                                        Err(e) => {
-                                                            debug!("Failed to decrypt for user {}: {}", sender_user_id, e);
                                                         }
                                                     }
                                                 } else {
-                                                    // DAVE not ready yet, passthrough raw payload
-                                                    debug!("DAVE not ready, passthrough {} bytes", payload.len());
+                                                    // DAVE not ready yet, strip transport nonce and decode as Opus
+                                                    let opus_data = if payload.len() > 4 {
+                                                        &payload[..payload.len() - 4]
+                                                    } else {
+                                                        payload
+                                                    };
+                                                    let samples = if let Some(decoder) = opus_decoder.as_mut() {
+                                                        match decoder.decode(opus_data) {
+                                                            Ok(pcm) => pcm.len(),
+                                                            Err(_) => opus_data.len(),
+                                                        }
+                                                    } else {
+                                                        opus_data.len()
+                                                    };
                                                     let _ = state.event_tx.send(AppEvent::VoiceAudioFrame {
                                                         guild_id: guild_id.get().to_string(),
                                                         user_id: sender_user_id.to_string(),
                                                         ssrc: header.ssrc,
-                                                        samples: payload.len(),
+                                                        samples,
                                                     });
                                                 }
                                             } else {
-                                                // No DAVE session, passthrough
-                                                debug!("No DAVE session, passthrough {} bytes", payload.len());
+                                                // No DAVE session, strip transport nonce and decode as Opus
+                                                let opus_data = if payload.len() > 4 {
+                                                    &payload[..payload.len() - 4]
+                                                } else {
+                                                    payload
+                                                };
+                                                let samples = if let Some(decoder) = opus_decoder.as_mut() {
+                                                    match decoder.decode(opus_data) {
+                                                        Ok(pcm) => pcm.len(),
+                                                        Err(_) => opus_data.len(),
+                                                    }
+                                                } else {
+                                                    opus_data.len()
+                                                };
                                                 let _ = state.event_tx.send(AppEvent::VoiceAudioFrame {
                                                     guild_id: guild_id.get().to_string(),
                                                     user_id: sender_user_id.to_string(),
                                                     ssrc: header.ssrc,
-                                                    samples: payload.len(),
+                                                    samples,
                                                 });
                                             }
                                         } else {
@@ -437,6 +506,23 @@ impl DaveyVoiceEngine {
                                     Ok(Some((commit, welcome))) => {
                                         if let Err(e) = gateway.send_commit_welcome(&commit, welcome.as_deref()).await {
                                             warn!("Failed to send commit welcome: {}", e);
+                                        } else {
+                                            // As the committing member, process our own commit to activate the session.
+                                            // The voice gateway may not send opcode 29 back to the committing member.
+                                            if let Err(e) = session.process_commit(&commit) {
+                                                warn!("Failed to process own commit: {}", e);
+                                            } else if session.is_ready() {
+                                                info!("DAVE session ready (own commit processed)");
+                                                let privacy_code = session.voice_privacy_code().unwrap_or("unknown").to_string();
+                                                state.record_voice_signal_trace(VoiceSignalTrace {
+                                                    guild_id: guild_id.get().to_string(),
+                                                    stage: "dave_ready".to_string(),
+                                                    message: format!("DAVE session ready via own commit, privacy_code={}", privacy_code),
+                                                    user_id: None,
+                                                    channel_id: Some(channel_id.get().to_string()),
+                                                    ssrc: gateway.ssrc(),
+                                                }).await;
+                                            }
                                         }
                                     }
                                     Ok(None) => {
@@ -444,20 +530,32 @@ impl DaveyVoiceEngine {
                                     }
                                     Err(e) => {
                                         warn!("Failed to process proposals: {}", e);
-                                        if let Err(e) = gateway.send_invalid_commit_welcome(&e.to_string()).await {
+                                        if let Err(e) = gateway.send_invalid_commit_welcome(0).await {
                                             warn!("Failed to send invalid commit welcome: {}", e);
                                         }
                                     }
                                 }
                             }
                         }
-                        Ok(VoiceEvent::DaveMlsAnnounceCommit { commit }) => {
-                            debug!("Received DAVE MLS Announce Commit: {} bytes", commit.len());
+                        Ok(VoiceEvent::DavePrepareTransition { transition_id }) => {
+                            warn!("DAVE Prepare Transition: {} — enabling passthrough mode", transition_id);
+                            let mut ds = dave_session.lock().await;
+                            if let Some(session) = ds.as_mut() {
+                                session.set_passthrough_mode(true);
+                            }
+                            // Send Transition Ready for downgrade
+                            let tid: u64 = transition_id.parse().unwrap_or(0);
+                            if let Err(e) = gateway.send_transition_ready(tid).await {
+                                warn!("Failed to send transition ready: {}", e);
+                            }
+                        }
+                        Ok(VoiceEvent::DaveMlsAnnounceCommit { transition_id, commit }) => {
+                            debug!("Received DAVE MLS Announce Commit: transition_id={}, commit={} bytes", transition_id, commit.len());
                             let mut ds = dave_session.lock().await;
                             if let Some(session) = ds.as_mut() {
                                 if let Err(e) = session.process_commit(&commit) {
                                     warn!("Failed to process commit: {}", e);
-                                    if let Err(e) = gateway.send_invalid_commit_welcome(&e.to_string()).await {
+                                    if let Err(e) = gateway.send_invalid_commit_welcome(transition_id).await {
                                         warn!("Failed to send invalid commit welcome: {}", e);
                                     }
                                 } else if session.is_ready() {
@@ -471,36 +569,64 @@ impl DaveyVoiceEngine {
                                         channel_id: Some(channel_id.get().to_string()),
                                         ssrc: gateway.ssrc(),
                                     }).await;
+                                    // We sent the commit, so we don't need to send transition ready.
+                                    // The voice gateway will handle the transition for us.
+                                    info!("DAVE session ready (commit received), no transition ready needed");
                                 }
                             }
                         }
-                        Ok(VoiceEvent::DaveMlsWelcome { welcome }) => {
-                            debug!("Received DAVE MLS Welcome: {} bytes", welcome.len());
-                            let mut ds = dave_session.lock().await;
-                            if let Some(session) = ds.as_mut() {
-                                if let Err(e) = session.process_welcome(&welcome) {
-                                    warn!("Failed to process welcome: {}", e);
-                                    if let Err(e) = gateway.send_invalid_commit_welcome(&e.to_string()).await {
-                                        warn!("Failed to send invalid commit welcome: {}", e);
-                                    }
-                                } else if session.is_ready() {
-                                    info!("DAVE session ready after welcome");
-                                    let privacy_code = session.voice_privacy_code().unwrap_or("unknown").to_string();
-                                    state.record_voice_signal_trace(VoiceSignalTrace {
-                                        guild_id: guild_id.get().to_string(),
-                                        stage: "dave_ready_welcome".to_string(),
-                                        message: format!("DAVE session ready via welcome, privacy_code={}", privacy_code),
-                                        user_id: None,
-                                        channel_id: Some(channel_id.get().to_string()),
-                                        ssrc: gateway.ssrc(),
-                                    }).await;
-                                }
-                            }
+                        Ok(VoiceEvent::DaveMlsWelcome { transition_id: _, welcome: _ }) => {
+                            // As the committing member, we sent the commit. The welcome is
+                            // for welcomed members, not for us. We should NOT process it.
+                            // Our commit was accepted, so the group is established.
+                            // The session will be activated when we receive opcode 29 (Announce Commit).
+                            debug!("Received DAVE MLS Welcome (ignored - we are the committing member)");
+                        }
+                        Ok(VoiceEvent::DaveExecuteTransition { transition_id }) => {
+                            info!("DAVE Execute Transition: {}", transition_id);
+                            state.record_voice_signal_trace(VoiceSignalTrace {
+                                guild_id: guild_id.get().to_string(),
+                                stage: "dave_execute_transition".to_string(),
+                                message: format!("E2EE media now active, transition_id={}", transition_id),
+                                user_id: None,
+                                channel_id: Some(channel_id.get().to_string()),
+                                ssrc: gateway.ssrc(),
+                            }).await;
                         }
                         Ok(VoiceEvent::DavePrepareEpoch { epoch, transition_id }) => {
                             info!("DAVE Prepare Epoch: epoch={}, transition={}", epoch, transition_id);
+                            let mut ds = dave_session.lock().await;
+                            if let Some(session) = ds.as_mut() {
+                                if epoch == 1 {
+                                    // Sole member reset - reinitialize session
+                                    warn!("Epoch 1 received, resetting DAVE session");
+                                    if let Err(e) = session.reset() {
+                                        warn!("Failed to reset session: {}", e);
+                                    }
+                                    if let Err(e) = session.reinit(
+                                        dave::MAX_DAVE_PROTOCOL_VERSION,
+                                    ) {
+                                        warn!("Failed to reinit session: {}", e);
+                                    } else {
+                                        // Generate and send new key package
+                                        match session.create_key_package() {
+                                            Ok(kp) => {
+                                                if let Err(e) = gateway.send_key_package(&kp).await {
+                                                    warn!("Failed to send new key package: {}", e);
+                                                } else {
+                                                    info!("Sent new key package after epoch reset");
+                                                }
+                                            }
+                                            Err(e) => {
+                                                warn!("Failed to create key package: {}", e);
+                                            }
+                                        }
+                                    }
+                                }
+                            }
                             // Send transition ready
-                            if let Err(e) = gateway.send_transition_ready(&transition_id).await {
+                            let tid: u64 = transition_id.parse().unwrap_or(0);
+                            if let Err(e) = gateway.send_transition_ready(tid).await {
                                 warn!("Failed to send transition ready: {}", e);
                             }
                         }

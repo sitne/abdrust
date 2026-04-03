@@ -154,12 +154,26 @@
 - [x] 再接続成功時にカウンタリセット
 - [x] Fatalエラー時は再接続せずに終了
 
-#### Phase 2: DAVE完全準拠（未着手）
+#### Phase 2: DAVEハンドシェイク実装（完了）
 
-- [ ] プロトコルバージョネゴシエーション（opcode 0, 4）の厳密化
-- [ ] MLS グループ作成・維持・破棄の完全実装
+- [x] tokio-websockets 0.11 への移行（Cloudflare 400回避）
+- [x] Opcode 28 (Commit Welcome) バイナリ形式修正（DAVEホワイトペーパー準拠）
+- [x] Opcode 29/30 バイナリパース（ULEB128 transition_id抽出）
+- [x] Opcode 31 (Invalid Commit Welcome) バイナリ形式
+- [x] `encode_uleb128` / `decode_uleb128` ヘルパー関数
+- [x] VoiceEventにtransition_id追加
+- [x] Opcode 23 (Transition Ready) 送信ロジック — commit送信側は不要と判明
+- [x] Opcode 24 (Prepare Epoch) epoch=1時のセッションリセット
+- [x] Opcode 21 (Prepare Transition) passthroughモード有効化
+- [x] Opcode 23 4006エラー解決 — commit送信側はopcode 23を送らない（Welcomed Memberのみが送信）
+- [x] 自分のcommitを `process_commit()` で処理 → `session.is_ready()` = true 達成
+- [x] DAVEプライバシーコード取得成功: `410053440514555022586707905441`
+- [x] DAVEマジックマーカー（0xFAFA）チェック — マーカーなしはpassthrough
+- [x] 音声フレーム受信 → passthrough正常動作（接続維持確認済み）
+- [ ] Opcode 22 (Execute Transition) 受信後のE2EEメディア開始
+- [ ] DAVE暗号化音声の復号成功（他クライアントがDAVE E2EE対応するまで待機）
+- [ ] DAVE暗号化音声の送信（Opusエンコード → DAVE暗号化 → RTP）
 - [ ] メンバー追加・削除（external sender経由）の完全実装
-- [ ] エポック遷移（prepare → ready → execute）の完全実装
 - [ ] Sole member reset
 - [ ] Invalid commit/welcome からのリカバリ
 - [ ] キーローテーション（nonce wrap対応）
@@ -189,8 +203,10 @@
 | Phase 1.7: UDP単一化 | 1-2時間 | 低 | ✅ 完了 |
 | Phase 1.8: エラーリカバリ | 4-8時間 | 中 | ✅ 完了 |
 | Phase 1.9: tokio-websockets移行 | 2-4時間 | 高 | ✅ 完了 |
-| Phase 1.10: session_idバグ修正 | 1-2時間 | 低 | 作業中 |
-| Phase 2: DAVE完全準拠 | 1-3ヶ月 | 高 | 未着手 |
+| Phase 1.10: session_idバグ修正 | 1-2時間 | 低 | ✅ 完了 |
+| Phase 2.1: DAVEバイナリ形式修正 | 4-8時間 | 高 | ✅ 完了 |
+| Phase 2.2: Opcode 23 4006エラー解決 | 2-4時間 | 高 | ✅ 完了 |
+| Phase 2.3: Opusデコード + E2EEメディア | 4-8時間 | 中 | 未着手 |
 | Phase 3: 基盤安定化 | 3-6ヶ月 | 中 | 未着手 |
 
 ---
@@ -478,8 +494,168 @@ Hello: heartbeat_interval=13750ms
 
 | 日付 | 変更 |
 |------|------|
+---
+
+## 2026-04-03: Phase 2 — DAVEプロトコル調査完了
+
+### DAVE プロトコル概要
+
+DAVE (Discord Audio & Video End-to-End Encryption) は **MLS (Messaging Layer Security, RFC 9420)** ベースのE2EEプロトコル。
+
+| 項目 | 値 |
+|------|-----|
+| MLSバージョン | 1.0 |
+| 暗号スイート | `MLS_128_DHKEMP256_AES128GCM_SHA256_P256` |
+| 資格情報 | Basic (identity = big-endian 64-bit Discord snowflake) |
+| Wire Format | PublicMessageのみ（PrivateMessageなし） |
+| Ratchet Tree | 有効 |
+
+### DAVE Opcode 一覧
+
+| Code | 名前 | 方向 | Binary | 説明 |
+|------|------|------|--------|------|
+| 25 | MLS External Sender | サーバー→クライアント | ✅ | 外部送信者のcredential+公開鍵 |
+| 26 | MLS Key Package | クライアント→サーバー | ✅ | MLS Key Package |
+| 27 | MLS Proposals | サーバー→クライアント | ✅ | 追加/削除proposal (op_type: 0=APPEND, 1=REVOKE) |
+| 28 | MLS Commit Welcome | クライアント→サーバー | ✅ | commit + optional welcome |
+| 29 | MLS Announce Commit | サーバー→クライアント | ✅ | 勝者commitのブロードキャスト |
+| 30 | MLS Welcome | サーバー→クライアント | ✅ | 新メンバーへのwelcome |
+| 31 | MLS Invalid Commit Welcome | クライアント→サーバー | ✅ | 無効なcommit/welcomeの報告 |
+
+### バイナリメッセージ形式
+
+**サーバー→クライアント:**
+```
+[Sequence Number (2 bytes, BE)] ← 存在する場合
+[Opcode (1 byte)]
+[Payload (variable)]
+```
+
+**クライアント→サーバー:**
+```
+[Opcode (1 byte)]
+[Payload (variable)]
+```
+
+### Opcode 28 (Commit Welcome) バイナリ形式
+
+```
+[Opcode: 0x1C (1 byte)]
+[Commit Length (2 bytes, BE)]
+[Commit (variable)]
+[Welcome Length (2 bytes, BE)]
+[Welcome (variable)] ← Welcome Length > 0 の場合のみ
+```
+
+### Opcode 29 (Announce Commit) バイナリ形式
+
+```
+[Opcode: 0x1D (1 byte)]
+[Transition ID (ULEB128)]
+[Commit (variable)]
+```
+
+### Opcode 30 (Welcome) バイナリ形式
+
+```
+[Opcode: 0x1E (1 byte)]
+[Transition ID (ULEB128)]
+[Welcome (variable)]
+```
+
+### SessionStatus 状態遷移
+
+```
+INACTIVE → PENDING          : set_external_sender()
+PENDING → AWAITING_RESPONSE : process_proposals() が CommitWelcome を返す
+AWAITING_RESPONSE → PENDING : process_proposals() が None を返す (is_ready=false)
+AWAITING_RESPONSE → ACTIVE  : process_proposals() が None を返す (is_ready=true)
+AWAITING_RESPONSE → ACTIVE  : process_commit() 成功
+PENDING → ACTIVE            : process_welcome() 成功
+ACTIVE → INACTIVE           : reset()
+```
+
+### 実装チェックリスト
+
+#### 優先度 1: バイナリメッセージ形式修正（現在対応中）
+- [x] Opcode 28 (Commit Welcome) をバイナリ形式に変更
+- [ ] Opcode 29 (Announce Commit) のバイナリパース — Transition ID (ULEB128) 対応
+- [ ] Opcode 30 (Welcome) のバイナリパース — Transition ID (ULEB128) 対応
+- [ ] Opcode 31 (Invalid) をバイナリ形式に変更 — Transition ID (ULEB128) 送信
+
+#### 優先度 2: Opcode 23/22 (Transition Ready/Execute)
+- [ ] Opcode 29/30 処理後に Opcode 23 (Transition Ready) を送信
+- [ ] Opcode 22 (Execute Transition) を受信してE2EEメディア開始
+
+#### 優先度 3: Opcode 24 (Prepare Epoch)
+- [ ] epoch=1 の場合はセッションリセット + 新規Key Package送信
+- [ ] epoch>1 の場合はプロトコルバージョン変更対応
+
+#### 優先度 4: メディア暗号化/復号
+- [ ] `session.is_ready()` 確認後に暗号化
+- [ ] `session.encrypt_opus()` でOpusパケット暗号化
+- [ ] `session.decrypt(user_id, MediaType::AUDIO, packet)` で復号
+- [ ] サイレンスパケット (0xF8, 0xFF, 0xFE) のpassthrough
+
+#### 優先度 5: エッジケース
+- [ ] Opcode 27 REVOKE 処理
+- [ ] Opcode 31 受信時のセッションリセット + 新規Key Package
+- [ ] 再接続時のDAVE状態回復
+
+### davey API リファレンス
+
+| プロトコルステップ | daveyメソッド | 戻り値 | 備考 |
+|---|---|---|---|
+| セッション作成 | `DaveSession::new(version, user_id, channel_id, key_pair?)` | `Result<Self>` | P256鍵ペア自動生成 |
+| External Sender | `session.set_external_sender(&[u8])` | `Result<()>` | グループ作成前に必須 |
+| Key Package | `session.create_key_package()` | `Result<Vec<u8>>` | 毎回新規生成（再利用不可） |
+| Proposals処理 | `session.process_proposals(op_type, &[u8], expected_ids?)` | `Result<Option<CommitWelcome>>` | proposals存在時CommitWelcome返す |
+| Welcome処理 | `session.process_welcome(&[u8])` | `Result<()>` | status=ACTIVE, is_ready=true |
+| Commit処理 | `session.process_commit(&[u8])` | `Result<()>` | status=ACTIVE, is_ready=true |
+| OPUS暗号化 | `session.encrypt_opus(&[u8])` | `Result<Cow<[u8]>>` | is_ready=true 必須 |
+| 復号 | `session.decrypt(user_id, MediaType, &[u8])` | `Result<Vec<u8>>` | 送信者のdecryptor必須 |
+| リセット | `session.reset()` | `Result<()>` | status=INACTIVE |
+| 再初期化 | `session.reinit(...)` | `Result<()>` | Reset + 新規初期化 |
+| ユーザー一覧 | `session.get_user_ids()` | `Option<Vec<u64>>` | グループなし時はNone |
+| プライバシーコード | `session.voice_privacy_code()` | `Option<&str>` | 遷移ごとに更新 |
+| 状態確認 | `session.status()` | `SessionStatus` | INACTIVE/PENDING/AWAITING_RESPONSE/ACTIVE |
+| Ready確認 | `session.is_ready()` | `bool` | 暗号化/復号可能か |
+
+---
+
+## 2026-04-03: Phase 2.1 — DAVEバイナリ形式修正完了
+
+### 作業内容
+
+**問題**: Opcode 23 (Transition Ready) 送信後に4020エラー（Bad Request）
+- Opcode 23のtransition_idが空文字列だった → opcode 29/30から抽出した数値を使用するように修正
+- Opcode 28 (Commit Welcome) のバイナリ形式をDAVEホワイトペーパー準拠に修正
+  - 誤: `[opcode][commit_len:u16][commit][welcome_len:u16][welcome]`
+  - 正: `[opcode][commit][welcome_length:ULEB128][welcome]`
+- Opcode 29/30のバイナリパースでULEB128 transition_idを抽出
+
+**テスト結果**:
+- Opcode 23送信を無効化 → 接続維持成功（約17秒間）
+- DAVEハンドシェイク完全成功（External Sender → Key Package → Proposals → Commit Welcome → Welcome）
+- UDP音声フレーム受信成功（passthroughモード）
+- ハートビート正常動作
+- Voice Leave正常動作
+
+**残る課題**:
+- Opcode 23 (Transition Ready) の4020エラー原因特定
+  - transition_id="0" が拒否されている可能性
+  - JSON形式ではなくバイナリ形式で送る必要がある可能性
+  - 公式クライアントの実装と差異がある可能性
+
+---
+
+## 変更履歴
+
+| 日付 | 変更 |
+|------|------|
+| 2026-04-03 | Phase 2.1完了: DAVEバイナリ形式修正 — 接続維持確認成功 |
 | 2026-04-03 | Phase 1.9: tokio-websockets移行 — Cloudflare 400回避成功 |
-| 2026-04-03 | バグ修正: Voice Join/Leave の UpdateVoiceState 送信 + VoiceSessionReady マッチング修正 |
+| 2026-04-03 | Phase 1.10: session_idバグ修正 — 実際のsession_idを使用 |
 | 2026-04-03 | 調査: Voice Gateway WebSocket 400エラー（Cloudflare拒否）— 6アプローチ試して全て失敗 |
 | 2026-04-02 | Phase 1.8: エラーリカバリ実装（指数バックオフ再接続 + watch/broadcastチャネル） |
 | 2026-04-02 | Phase 1.7: UDPソケット単一化（IP Discoveryと受信/送信で同一ソケット） |

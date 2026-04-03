@@ -334,18 +334,21 @@ impl IpDiscovery {
     /// Returns (address, port) as discovered by the server
     pub fn discover(&self) -> Result<(String, u16)> {
         // Build IP discovery packet
-        // Type: u16 (1 = request), Length: u16 (70), SSRC: u32, Address: [u8; 64], Port: u16
         let mut buf = Vec::with_capacity(74);
-        buf.write_u16::<BigEndian>(1)?; // Type: request
-        buf.write_u16::<BigEndian>(70)?; // Length
-        buf.write_u32::<BigEndian>(self.ssrc)?; // SSRC
+        buf.write_u16::<BigEndian>(1)?;
+        buf.write_u16::<BigEndian>(70)?;
+        buf.write_u32::<BigEndian>(self.ssrc)?;
 
-        // 64 bytes for address (null-terminated)
         let addr_buf = [0u8; 64];
         buf.extend_from_slice(&addr_buf);
 
-        // 2 bytes for port
         buf.write_u16::<BigEndian>(0)?;
+
+        // Set blocking mode for IP discovery
+        self.socket.set_nonblocking(false).ok();
+        self.socket
+            .set_read_timeout(Some(Duration::from_secs(5)))
+            .ok();
 
         self.socket
             .send_to(&buf, self.remote_addr)
@@ -364,13 +367,10 @@ impl IpDiscovery {
             anyhow::bail!("IP discovery response too short: {} bytes", len);
         }
 
-        // Parse response
-        // Type: u16 (should be 2), Length: u16 (70), SSRC: u32, Address: [u8; 64], Port: u16
         let _resp_type = u16::from_be_bytes([response[0], response[1]]);
         let _resp_len = u16::from_be_bytes([response[2], response[3]]);
         let _resp_ssrc = u32::from_be_bytes([response[4], response[5], response[6], response[7]]);
 
-        // Address is null-terminated string
         let addr_bytes = &response[8..72];
         let null_pos = addr_bytes.iter().position(|&b| b == 0).unwrap_or(64);
         let address = String::from_utf8_lossy(&addr_bytes[..null_pos]).to_string();
@@ -415,5 +415,41 @@ impl OpusEncoder {
     /// Encode silence frame (3 bytes: 0xF8, 0xFF, 0xFE)
     pub fn silence_frame() -> Vec<u8> {
         vec![0xF8, 0xFF, 0xFE]
+    }
+}
+
+/// Opus decoder wrapper
+pub struct OpusDecoder {
+    decoder: opus::Decoder,
+}
+
+impl OpusDecoder {
+    /// Create a new Opus decoder
+    /// 48kHz, mono, voice quality
+    pub fn new() -> Result<Self> {
+        let decoder = opus::Decoder::new(48_000, opus::Channels::Mono)
+            .context("failed to create Opus decoder")?;
+
+        Ok(Self { decoder })
+    }
+
+    /// Decode Opus packet to PCM samples
+    /// Input: Opus encoded packet
+    /// Output: i16 PCM samples at 48kHz, mono (up to 960 samples = 20ms)
+    pub fn decode(&mut self, opus_data: &[u8]) -> Result<Vec<i16>> {
+        let mut pcm = vec![0i16; 960]; // 20ms at 48kHz
+        let len = self
+            .decoder
+            .decode(opus_data, &mut pcm, false)
+            .context("failed to decode Opus packet")?;
+
+        pcm.truncate(len);
+        Ok(pcm)
+    }
+
+    /// Decode silence frame (3 bytes: 0xF8, 0xFF, 0xFE) to PCM
+    pub fn decode_silence() -> Vec<i16> {
+        // Silence frame decodes to 960 zero samples (20ms at 48kHz)
+        vec![0i16; 960]
     }
 }

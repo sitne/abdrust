@@ -287,13 +287,13 @@ impl VoiceGateway {
         Ok(())
     }
 
-    /// Send DAVE transition ready (opcode 23)
-    pub async fn send_transition_ready(&mut self, transition_id: &str) -> Result<()> {
-        let payload = serde_json::json!({
-            "transition_id": transition_id,
-        });
-        self.send_json(23, &payload).await?;
-        debug!("Sent DAVE transition ready");
+    /// Send DAVE transition ready (opcode 23) - binary message
+    pub async fn send_transition_ready(&mut self, transition_id: u64) -> Result<()> {
+        let mut buf = Vec::with_capacity(1 + 10);
+        buf.push(23);
+        encode_uleb128(&mut buf, transition_id);
+        self.send_binary(buf).await?;
+        debug!("Sent DAVE transition ready (transition_id={})", transition_id);
         Ok(())
     }
 
@@ -307,28 +307,35 @@ impl VoiceGateway {
         Ok(())
     }
 
-    /// Send DAVE MLS commit welcome (opcode 28)
+    /// Send DAVE MLS commit welcome (opcode 28) - binary message
     pub async fn send_commit_welcome(
         &mut self,
         commit: &[u8],
         welcome: Option<&[u8]>,
     ) -> Result<()> {
-        let payload = serde_json::json!({
-            "commit": commit,
-            "welcome": welcome,
-        });
-        self.send_json(28, &payload).await?;
-        debug!("Sent DAVE MLS commit welcome");
+        // Binary format per DAVE whitepaper:
+        // [opcode: u8][commit (variable)][welcome_length (ULEB128)][welcome (variable)]
+        let mut buf = Vec::with_capacity(1 + commit.len() + 5 + welcome.map(|w| w.len()).unwrap_or(0));
+        buf.push(28);
+        buf.extend_from_slice(commit);
+        if let Some(w) = welcome {
+            encode_uleb128(&mut buf, w.len() as u64);
+            buf.extend_from_slice(w);
+        } else {
+            encode_uleb128(&mut buf, 0);
+        }
+        self.send_binary(buf).await?;
+        debug!("Sent DAVE MLS commit welcome (commit={} bytes)", commit.len());
         Ok(())
     }
 
-    /// Send DAVE MLS invalid commit welcome (opcode 31)
-    pub async fn send_invalid_commit_welcome(&mut self, reason: &str) -> Result<()> {
-        let payload = serde_json::json!({
-            "reason": reason,
-        });
-        self.send_json(31, &payload).await?;
-        debug!("Sent DAVE MLS invalid commit welcome: {}", reason);
+    /// Send DAVE MLS invalid commit welcome (opcode 31) - binary message
+    pub async fn send_invalid_commit_welcome(&mut self, transition_id: u64) -> Result<()> {
+        let mut buf = Vec::with_capacity(1 + 10); // opcode + max ULEB128
+        buf.push(31);
+        encode_uleb128(&mut buf, transition_id);
+        self.send_binary(buf).await?;
+        debug!("Sent DAVE MLS invalid commit welcome (transition_id={})", transition_id);
         Ok(())
     }
 
@@ -373,7 +380,14 @@ impl VoiceGateway {
             let data = msg.into_payload();
             self.handle_binary_message(data.to_vec()).await
         } else if msg.is_close() {
-            info!("Voice gateway closed");
+            let payload = msg.into_payload();
+            if !payload.is_empty() {
+                let code = u16::from_be_bytes([payload[0], payload[1]]);
+                let reason = String::from_utf8_lossy(&payload[2..]);
+                warn!("Voice gateway closed: code={}, reason={}", code, reason);
+            } else {
+                info!("Voice gateway closed (no close frame)");
+            }
             Ok(VoiceEvent::Closed)
         } else if msg.is_ping() {
             let data = msg.into_payload();
@@ -499,16 +513,18 @@ impl VoiceGateway {
             29 => {
                 let commit: DaveMlsAnnounceCommitPayload = serde_json::from_value(data)
                     .context("failed to parse DAVE MLS Announce Commit")?;
-                debug!("DAVE MLS Announce Commit: {} bytes", commit.commit.len());
+                debug!("DAVE MLS Announce Commit (JSON): {} bytes", commit.commit.len());
                 Ok(VoiceEvent::DaveMlsAnnounceCommit {
+                    transition_id: 0,
                     commit: commit.commit,
                 })
             }
             30 => {
                 let welcome: DaveMlsWelcomePayload = serde_json::from_value(data)
                     .context("failed to parse DAVE MLS Welcome")?;
-                debug!("DAVE MLS Welcome: {} bytes", welcome.welcome.len());
+                debug!("DAVE MLS Welcome (JSON): {} bytes", welcome.welcome.len());
                 Ok(VoiceEvent::DaveMlsWelcome {
+                    transition_id: 0,
                     welcome: welcome.welcome,
                 })
             }
@@ -578,16 +594,32 @@ impl VoiceGateway {
                 })
             }
             29 => {
-                debug!("DAVE MLS Announce Commit (binary): {} bytes", payload.len());
-                Ok(VoiceEvent::DaveMlsAnnounceCommit {
-                    commit: payload.to_vec(),
-                })
+                // Binary: [opcode][transition_id ULEB128][commit]
+                if payload.is_empty() {
+                    return Ok(VoiceEvent::Unknown);
+                }
+                let (transition_id, offset) = decode_uleb128(&payload);
+                let commit = if offset < payload.len() {
+                    payload[offset..].to_vec()
+                } else {
+                    Vec::new()
+                };
+                debug!("DAVE MLS Announce Commit: transition_id={}, commit={} bytes", transition_id, commit.len());
+                Ok(VoiceEvent::DaveMlsAnnounceCommit { transition_id, commit })
             }
             30 => {
-                debug!("DAVE MLS Welcome (binary): {} bytes", payload.len());
-                Ok(VoiceEvent::DaveMlsWelcome {
-                    welcome: payload.to_vec(),
-                })
+                // Binary: [opcode][transition_id ULEB128][welcome]
+                if payload.is_empty() {
+                    return Ok(VoiceEvent::Unknown);
+                }
+                let (transition_id, offset) = decode_uleb128(&payload);
+                let welcome = if offset < payload.len() {
+                    payload[offset..].to_vec()
+                } else {
+                    Vec::new()
+                };
+                debug!("DAVE MLS Welcome: transition_id={}, welcome={} bytes", transition_id, welcome.len());
+                Ok(VoiceEvent::DaveMlsWelcome { transition_id, welcome })
             }
             _ => {
                 Ok(VoiceEvent::AudioFrame {
@@ -673,6 +705,37 @@ impl VoiceGateway {
     }
 }
 
+/// Encode a u64 as ULEB128
+fn encode_uleb128(buf: &mut Vec<u8>, mut value: u64) {
+    loop {
+        let mut byte = (value & 0x7F) as u8;
+        value >>= 7;
+        if value != 0 {
+            byte |= 0x80;
+        }
+        buf.push(byte);
+        if value == 0 {
+            break;
+        }
+    }
+}
+
+/// Decode a ULEB128 value from bytes, returning (value, bytes_consumed)
+fn decode_uleb128(data: &[u8]) -> (u64, usize) {
+    let mut value: u64 = 0;
+    let mut shift: u32 = 0;
+    let mut offset = 0;
+    for &byte in data {
+        value |= ((byte & 0x7F) as u64) << shift;
+        offset += 1;
+        if (byte & 0x80) == 0 {
+            break;
+        }
+        shift += 7;
+    }
+    (value, offset)
+}
+
 /// Disconnect reason for reconnection logic
 #[derive(Debug, Clone)]
 pub enum DisconnectReason {
@@ -719,9 +782,11 @@ pub enum VoiceEvent {
         proposals: Vec<u8>,
     },
     DaveMlsAnnounceCommit {
+        transition_id: u64,
         commit: Vec<u8>,
     },
     DaveMlsWelcome {
+        transition_id: u64,
         welcome: Vec<u8>,
     },
     AudioFrame {
