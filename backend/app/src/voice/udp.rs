@@ -146,7 +146,7 @@ pub enum TransportCryptoMode {
 }
 
 impl TransportCryptoMode {
-    pub fn from_str(mode: &str) -> Self {
+    pub fn parse_mode(mode: &str) -> Self {
         match mode {
             "aead_aes256_gcm_rtpsize" => Self::Aes256Gcm,
             "aead_xchacha20_poly1305_rtpsize" => Self::XChaCha20Poly1305,
@@ -370,7 +370,7 @@ impl VoiceUdpSocket {
         ssrc: u32,
         sequence: u16,
     ) -> Result<Vec<u8>> {
-        let mode = TransportCryptoMode::from_str(&self.encryption_mode);
+        let mode = TransportCryptoMode::parse_mode(&self.encryption_mode);
 
         if mode == TransportCryptoMode::None {
             return Ok(payload_with_tag.to_vec());
@@ -682,19 +682,19 @@ mod tests {
     #[test]
     fn test_transport_crypto_mode_from_str() {
         assert_eq!(
-            TransportCryptoMode::from_str("aead_aes256_gcm_rtpsize"),
+            TransportCryptoMode::parse_mode("aead_aes256_gcm_rtpsize"),
             TransportCryptoMode::Aes256Gcm
         );
         assert_eq!(
-            TransportCryptoMode::from_str("aead_xchacha20_poly1305_rtpsize"),
+            TransportCryptoMode::parse_mode("aead_xchacha20_poly1305_rtpsize"),
             TransportCryptoMode::XChaCha20Poly1305
         );
         assert_eq!(
-            TransportCryptoMode::from_str("xsalsa20_poly1305"),
+            TransportCryptoMode::parse_mode("xsalsa20_poly1305"),
             TransportCryptoMode::None
         );
         assert_eq!(
-            TransportCryptoMode::from_str("unknown"),
+            TransportCryptoMode::parse_mode("unknown"),
             TransportCryptoMode::None
         );
     }

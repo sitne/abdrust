@@ -6,7 +6,7 @@ COPY frontend/package.json frontend/tsconfig.json frontend/vite.config.ts fronte
 COPY frontend/src ./src
 RUN npm install && npm run build
 
-FROM rust:1.85-bookworm AS backend
+FROM rust:1.89-bookworm AS backend
 ARG PROJECT_NAME
 WORKDIR /app
 COPY backend ./backend
