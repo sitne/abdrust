@@ -8,6 +8,7 @@ RUN npm install && npm run build
 
 FROM rust:1.89-bookworm AS backend
 ARG PROJECT_NAME
+RUN apt-get update && apt-get install -y --no-install-recommends cmake pkg-config libopus-dev && rm -rf /var/lib/apt/lists/*
 WORKDIR /app
 COPY backend ./backend
 COPY --from=frontend /app/frontend/dist ./frontend/dist
