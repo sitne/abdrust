@@ -1,9 +1,4 @@
-use anyhow::Result;
-
 /// A source of audio data that can be played over voice.
-///
-/// Implementations provide Opus-encoded packets or raw PCM samples.
-/// The voice engine handles encoding (if needed) and DAVE encryption.
 pub trait AudioSource: Send + Sync {
     /// Get the next packet of audio data.
     /// Returns `None` when the source is exhausted.

@@ -11,6 +11,8 @@ pub struct DaveyVoiceSession {
     signing_key: SigningKeyPair,
 }
 
+pub type CommitWelcome = (Vec<u8>, Option<Vec<u8>>);
+
 impl DaveyVoiceSession {
     /// Create a new DAVE session
     pub fn new(user_id: u64, channel_id: u64, protocol_version: u16) -> Result<Self> {
@@ -89,7 +91,7 @@ impl DaveyVoiceSession {
         &mut self,
         operation_type: u8,
         proposals: &[u8],
-    ) -> Result<Option<(Vec<u8>, Option<Vec<u8>>)>> {
+    ) -> Result<Option<CommitWelcome>> {
         let op_type = match operation_type {
             0 => davey::ProposalsOperationType::APPEND,
             1 => davey::ProposalsOperationType::REVOKE,

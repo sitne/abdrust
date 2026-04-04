@@ -27,17 +27,16 @@ async fn handle_socket(state: AppState, socket: WebSocket) {
     let mut ready_rx = state.ready_tx.subscribe();
     let (mut tx, mut rx_ws) = socket.split();
     let mut subscribed: Option<String> = None;
-    let mut instance_id: Option<String> = None;
+    let mut _instance_id: Option<String> = None;
     let mut session_ok = false;
     let auth_required = matches!(state.config.activity_mode, crate::config::ActivityMode::Discord);
     let mut authorized_guilds: Option<Vec<String>> = None;
 
-    if !auth_required {
-        if let Some(ready) = state.ready_state.lock().await.clone() {
-            if let Ok(text) = serde_json::to_string(&serde_json::json!({"type":"bot_ready","data":ready})) {
-                let _ = tx.send(Message::text(text)).await;
-            }
-        }
+    if !auth_required
+        && let Some(ready) = state.ready_state.lock().await.clone()
+        && let Ok(text) = serde_json::to_string(&serde_json::json!({"type":"bot_ready","data":ready}))
+    {
+        let _ = tx.send(Message::text(text)).await;
     }
 
     loop {
@@ -49,7 +48,7 @@ async fn handle_socket(state: AppState, socket: WebSocket) {
                             match client_msg.r#type.as_str() {
                                 "subscribe" => {
                                     subscribed = client_msg.guild_id;
-                                    instance_id = client_msg.instance_id;
+                                    _instance_id = client_msg.instance_id;
                                 }
                                 "session" => {
                                     if let Some(session_id) = client_msg.session_id {
@@ -57,12 +56,11 @@ async fn handle_socket(state: AppState, socket: WebSocket) {
                                             session_ok = true;
                                             authorized_guilds = Some(session.guild_ids.clone());
                                             let _ = tx.send(Message::text(serde_json::json!({"type":"session_ok"}).to_string())).await;
-                                            if let Some(ready) = state.ready_state.lock().await.clone() {
-                                                if !auth_required || session_ok {
-                                                    if let Ok(text) = serde_json::to_string(&serde_json::json!({"type":"bot_ready","data":ready})) {
-                                                        let _ = tx.send(Message::text(text)).await;
-                                                    }
-                                                }
+                                            if let Some(ready) = state.ready_state.lock().await.clone()
+                                                && (!auth_required || session_ok)
+                                                && let Ok(text) = serde_json::to_string(&serde_json::json!({"type":"bot_ready","data":ready}))
+                                            {
+                                                let _ = tx.send(Message::text(text)).await;
                                             }
                                         } else {
                                             let _ = tx.send(Message::text(serde_json::json!({"type":"error","message":"invalid session"}).to_string())).await;
@@ -83,12 +81,11 @@ async fn handle_socket(state: AppState, socket: WebSocket) {
                 }
             }
             ready = ready_rx.recv() => {
-                if let Ok(status) = ready {
-                    if !auth_required || session_ok {
-                        if let Ok(text) = serde_json::to_string(&serde_json::json!({"type":"bot_ready","data":status})) {
-                            let _ = tx.send(Message::text(text)).await;
-                        }
-                    }
+                if let Ok(status) = ready
+                    && (!auth_required || session_ok)
+                    && let Ok(text) = serde_json::to_string(&serde_json::json!({"type":"bot_ready","data":status}))
+                {
+                    let _ = tx.send(Message::text(text)).await;
                 }
             }
             event = rx.recv() => {

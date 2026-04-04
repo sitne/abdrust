@@ -20,13 +20,16 @@ pub struct AppState {
     pub voice_engine: Arc<dyn VoiceEngine>,
 }
 
+pub type GuildUserChannels = HashMap<Id<GuildMarker>, HashMap<Id<UserMarker>, Id<ChannelMarker>>>;
+pub type GuildUserMetaMap = HashMap<Id<GuildMarker>, Arc<Mutex<HashMap<Id<UserMarker>, VoiceUserMeta>>>>;
+
 pub struct BotState {
     pub http: Arc<Client>,
     pub gateway: MessageSender,
     pub bot_user_id: Id<UserMarker>,
     pub voice_sessions: Mutex<HashMap<Id<GuildMarker>, VoiceSession>>,
-    pub user_voice_states: Mutex<HashMap<Id<GuildMarker>, HashMap<Id<UserMarker>, Id<ChannelMarker>>>>,
-    pub voice_user_meta: Mutex<HashMap<Id<GuildMarker>, Arc<Mutex<HashMap<Id<UserMarker>, VoiceUserMeta>>>>>,
+    pub user_voice_states: Mutex<GuildUserChannels>,
+    pub voice_user_meta: Mutex<GuildUserMetaMap>,
     pub voice_join_states: Mutex<HashMap<Id<GuildMarker>, VoiceJoinState>>,
     pub last_voice_receive_traces: Mutex<HashMap<String, VoiceReceiveTrace>>,
     pub last_voice_signal_traces: Mutex<HashMap<String, VoiceSignalTrace>>,
@@ -335,7 +338,7 @@ impl AppState {
 
     pub async fn increment_voice_metric(&self, metric: impl FnOnce(&mut VoiceMetrics)) {
         let mut metrics = self.bot.metrics.lock().await;
-        metric(&mut *metrics);
+        metric(&mut metrics);
     }
 
     pub async fn voice_metadata_for_guild(&self, guild_id: Id<GuildMarker>) -> Arc<Mutex<HashMap<Id<UserMarker>, VoiceUserMeta>>> {

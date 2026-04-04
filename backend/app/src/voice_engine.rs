@@ -1,3 +1,4 @@
+#![allow(clippy::too_many_arguments, clippy::collapsible_if)]
 use crate::{
     dave,
     state::{AppEvent, AppState, VoiceCapabilities, VoiceJoinState, VoiceSession, VoiceSignalTrace, VoiceUserMeta},
@@ -64,6 +65,7 @@ pub enum AudioData {
 }
 
 /// Active voice connection for a guild
+#[allow(dead_code)]
 struct ActiveVoiceConnection {
     guild_id: Id<GuildMarker>,
     channel_id: Id<ChannelMarker>,
@@ -98,11 +100,11 @@ impl DaveyVoiceEngine {
     /// Send audio data to a voice channel
     pub async fn send_audio(&self, guild_id: Id<GuildMarker>, audio: AudioData) -> Result<()> {
         let connections = self.connections.lock().await;
-        if let Some(conn) = connections.connections.get(&guild_id) {
-            if let Some(tx) = &conn.audio_tx {
-                let _ = tx.send(audio);
-                return Ok(());
-            }
+        if let Some(conn) = connections.connections.get(&guild_id)
+            && let Some(tx) = &conn.audio_tx
+        {
+            let _ = tx.send(audio);
+            return Ok(());
         }
         anyhow::bail!("no active voice connection for guild {}", guild_id.get())
     }
@@ -421,7 +423,7 @@ impl DaveyVoiceEngine {
                                 // UDP recv errors are expected (timeout, would_block) — only warn on persistent errors
                                 static UDP_ERROR_COUNT: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
                                 let count = UDP_ERROR_COUNT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                                if count < 5 || count % 100 == 0 {
+                                if count < 5 || count.is_multiple_of(100) {
                                     warn!("UDP recv error (count={}): {}", count + 1, e);
                                 }
                             }
@@ -750,7 +752,7 @@ impl DaveyVoiceEngine {
                             warn!("Voice gateway closed");
                             return DisconnectReason::NormalClose;
                         }
-                        Ok(VoiceEvent::HeartbeatAck) | Ok(VoiceEvent::Pong) => {
+                        Ok(VoiceEvent::Pong) => {
                             // Normal
                         }
                         Ok(VoiceEvent::ClientDisconnect) => {
@@ -1110,8 +1112,8 @@ impl VoiceEngine for DaveyVoiceEngine {
                 state.remove_voice_user_meta(guild_id, event.user_id).await;
             }
 
-            if event.channel_id.is_some() {
-                state.set_user_voice_state(guild_id, event.user_id, event.channel_id.unwrap()).await;
+            if let Some(channel_id) = event.channel_id {
+                state.set_user_voice_state(guild_id, event.user_id, channel_id).await;
                 // Store bot's session_id for voice gateway connection
                 if event.user_id == self.bot_user_id {
                     state.bot.bot_pending_session_id.lock().await.insert(guild_id, event.session_id.clone());

@@ -621,7 +621,7 @@ impl VoiceGateway {
                 if payload.is_empty() {
                     return Ok(VoiceEvent::Unknown);
                 }
-                let (transition_id, offset) = decode_uleb128(&payload);
+                let (transition_id, offset) = decode_uleb128(payload);
                 let commit = if offset < payload.len() {
                     payload[offset..].to_vec()
                 } else {
@@ -635,7 +635,7 @@ impl VoiceGateway {
                 if payload.is_empty() {
                     return Ok(VoiceEvent::Unknown);
                 }
-                let (transition_id, offset) = decode_uleb128(&payload);
+                let (transition_id, offset) = decode_uleb128(payload);
                 let welcome = if offset < payload.len() {
                     payload[offset..].to_vec()
                 } else {

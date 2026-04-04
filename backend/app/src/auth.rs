@@ -33,13 +33,13 @@ pub async fn validate_session_id(state: &crate::state::AppState, headers: &Heade
         .map(str::to_string);
 
     if !auth_mode_enabled(&state.config) {
-        if let Some(session_id) = session_id {
-            if let Some(session) = state.auth_session(&session_id).await {
-                return Ok(AuthContext {
-                    session_id: session.session_id,
-                    guild_id: None,
-                });
-            }
+        if let Some(session_id) = session_id
+            && let Some(session) = state.auth_session(&session_id).await
+        {
+            return Ok(AuthContext {
+                session_id: session.session_id,
+                guild_id: None,
+            });
         }
 
         return Ok(AuthContext {
