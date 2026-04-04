@@ -246,170 +246,97 @@ impl DaveyVoiceEngine {
                     if let Some(udp) = sock.as_ref() {
                         match udp.recv(&mut udp_buf) {
                             Ok(Some(len)) => {
-                                let data = udp_buf[..len].to_vec();
+                                let data = &udp_buf[..len];
                                 // Parse RTP header
-                                match RtpHeader::parse(&data) {
+                                match RtpHeader::parse(data) {
                                     Ok((header, payload_offset)) => {
-                                        let payload = &data[payload_offset..];
-                                        debug!("UDP audio: SSRC={}, seq={}, payload={} bytes", header.ssrc, header.sequence, payload.len());
+                                        let rtp_header = &data[..payload_offset];
+                                        let payload_with_tag = &data[payload_offset..];
+                                        debug!("UDP audio: SSRC={}, seq={}, payload={} bytes", header.ssrc, header.sequence, payload_with_tag.len());
 
-                                        // Look up user_id for this SSRC
+                                        // Step 1: Transport decryption (AES-256-GCM per RFC 7714)
+                                        let decrypted_payload = match udp.decrypt_transport(
+                                            rtp_header,
+                                            payload_with_tag,
+                                            header.ssrc,
+                                            header.sequence,
+                                        ) {
+                                            Ok(p) => p,
+                                            Err(e) => {
+                                                warn!("Transport decrypt failed: {}", e);
+                                                return;
+                                            }
+                                        };
+
+                                        // Step 2: Look up user_id for this SSRC
                                         let ssrc_map = ssrc_to_user.lock().await;
-                                        if let Some(&sender_user_id) = ssrc_map.get(&header.ssrc) {
-                                            drop(ssrc_map);
+                                        let sender_user_id = match ssrc_map.get(&header.ssrc) {
+                                            Some(&uid) => uid,
+                                            None => {
+                                                drop(ssrc_map);
+                                                debug!("Unknown SSRC: {}", header.ssrc);
+                                                return;
+                                            }
+                                        };
+                                        drop(ssrc_map);
 
-                                            // Try to decrypt with DAVE session
-                                            let mut ds = dave_session.lock().await;
-                                            if let Some(session) = ds.as_mut() {
-                                                if session.is_ready() {
-                                                    // Check for DAVE magic marker (0xFAFA) at the end of the payload
-                                                    let has_dave_marker = payload.len() >= 2
-                                                        && payload[payload.len() - 2] == 0xFA
-                                                        && payload[payload.len() - 1] == 0xFA;
+                                        // Step 3: DAVE E2EE decryption (if session ready)
+                                        let mut ds = dave_session.lock().await;
+                                        let opus_data = if let Some(session) = ds.as_mut() {
+                                            if session.is_ready() {
+                                                // Check for DAVE magic marker (0xFAFA) at the end
+                                                let has_dave_marker = decrypted_payload.len() >= 2
+                                                    && decrypted_payload[decrypted_payload.len() - 2] == 0xFA
+                                                    && decrypted_payload[decrypted_payload.len() - 1] == 0xFA;
 
-                                                    if has_dave_marker {
-                                                        match session.decrypt(sender_user_id, payload) {
-                                                            Ok(decrypted) => {
-                                                                debug!("Decrypted DAVE audio: {} bytes for user {}", decrypted.len(), sender_user_id);
-                                                                // decrypted is still Opus-encoded — decode to PCM
-                                                                let samples = if let Some(decoder) = opus_decoder.as_mut() {
-                                                                    match decoder.decode(&decrypted) {
-                                                                        Ok(pcm) => {
-                                                                            debug!("Decoded DAVE Opus: {} bytes -> {} PCM samples", decrypted.len(), pcm.len());
-                                                                            pcm.len()
-                                                                        }
-                                                                        Err(e) => {
-                                                                            debug!("Failed to decode DAVE Opus: {}", e);
-                                                                            decrypted.len()
-                                                                        }
-                                                                    }
-                                                                } else {
-                                                                    decrypted.len()
-                                                                };
-                                                                let _ = state.event_tx.send(AppEvent::VoiceAudioFrame {
-                                                                    guild_id: guild_id.get().to_string(),
-                                                                    user_id: sender_user_id.to_string(),
-                                                                    ssrc: header.ssrc,
-                                                                    samples,
-                                                                });
-                                                            }
-                                                            Err(e) => {
-                                                                // DAVE decryption failed — this user may not be E2EE-enabled.
-                                                                // Enable passthrough mode to receive transport-encrypted Opus.
-                                                                warn!("DAVE decrypt failed for user {}: {} — enabling passthrough mode", sender_user_id, e);
-                                                                session.set_passthrough_mode(true);
-                                                                // Fall through to passthrough decode below
-                                                                let opus_data = if payload.len() > 4 {
-                                                                    &payload[..payload.len() - 4]
-                                                                } else {
-                                                                    payload
-                                                                };
-                                                                let samples = if let Some(decoder) = opus_decoder.as_mut() {
-                                                                    match decoder.decode(opus_data) {
-                                                                        Ok(pcm) => {
-                                                                            debug!("Decoded passthrough Opus: {} bytes -> {} PCM samples", opus_data.len(), pcm.len());
-                                                                            pcm.len()
-                                                                        }
-                                                                        Err(e) => {
-                                                                            debug!("Failed to decode passthrough Opus: {}", e);
-                                                                            0
-                                                                        }
-                                                                    }
-                                                                } else {
-                                                                    opus_data.len()
-                                                                };
-                                                                let _ = state.event_tx.send(AppEvent::VoiceAudioFrame {
-                                                                    guild_id: guild_id.get().to_string(),
-                                                                    user_id: sender_user_id.to_string(),
-                                                                    ssrc: header.ssrc,
-                                                                    samples,
-                                                                });
-                                                            }
+                                                if has_dave_marker {
+                                                    match session.decrypt(sender_user_id, &decrypted_payload) {
+                                                        Ok(decrypted) => {
+                                                            debug!("Decrypted DAVE audio: {} bytes for user {}", decrypted.len(), sender_user_id);
+                                                            decrypted
                                                         }
-                                                    } else {
-                                                        // No DAVE marker - strip transport nonce (last 4 bytes) and decode as Opus
-                                                        let opus_data = if payload.len() > 4 {
-                                                            &payload[..payload.len() - 4]
-                                                        } else {
-                                                            payload
-                                                        };
-                                                        let samples = if let Some(decoder) = opus_decoder.as_mut() {
-                                                            match decoder.decode(opus_data) {
-                                                                Ok(pcm) => {
-                                                                    debug!("Decoded Opus (no DAVE): {} bytes (from {}) -> {} PCM samples", opus_data.len(), payload.len(), pcm.len());
-                                                                    let _ = state.event_tx.send(AppEvent::VoiceAudioFrame {
-                                                                        guild_id: guild_id.get().to_string(),
-                                                                        user_id: sender_user_id.to_string(),
-                                                                        ssrc: header.ssrc,
-                                                                        samples: pcm.len(),
-                                                                    });
-                                                                    pcm.len()
-                                                                }
-                                                                Err(e) => {
-                                                                    debug!("Failed to decode Opus (no DAVE): {}", e);
-                                                                    0
-                                                                }
-                                                            }
-                                                        } else {
-                                                            opus_data.len()
-                                                        };
-                                                        if samples == 0 && opus_decoder.is_none() {
-                                                            let _ = state.event_tx.send(AppEvent::VoiceAudioFrame {
-                                                                guild_id: guild_id.get().to_string(),
-                                                                user_id: sender_user_id.to_string(),
-                                                                ssrc: header.ssrc,
-                                                                samples: opus_data.len(),
-                                                            });
+                                                        Err(e) => {
+                                                            warn!("DAVE decrypt failed for user {}: {} — enabling passthrough", sender_user_id, e);
+                                                            session.set_passthrough_mode(true);
+                                                            decrypted_payload
                                                         }
                                                     }
                                                 } else {
-                                                    // DAVE not ready yet, strip transport nonce and decode as Opus
-                                                    let opus_data = if payload.len() > 4 {
-                                                        &payload[..payload.len() - 4]
-                                                    } else {
-                                                        payload
-                                                    };
-                                                    let samples = if let Some(decoder) = opus_decoder.as_mut() {
-                                                        match decoder.decode(opus_data) {
-                                                            Ok(pcm) => pcm.len(),
-                                                            Err(_) => opus_data.len(),
-                                                        }
-                                                    } else {
-                                                        opus_data.len()
-                                                    };
-                                                    let _ = state.event_tx.send(AppEvent::VoiceAudioFrame {
-                                                        guild_id: guild_id.get().to_string(),
-                                                        user_id: sender_user_id.to_string(),
-                                                        ssrc: header.ssrc,
-                                                        samples,
-                                                    });
+                                                    // No DAVE marker — already transport-decrypted Opus
+                                                    decrypted_payload
                                                 }
                                             } else {
-                                                // No DAVE session, strip transport nonce and decode as Opus
-                                                let opus_data = if payload.len() > 4 {
-                                                    &payload[..payload.len() - 4]
-                                                } else {
-                                                    payload
-                                                };
-                                                let samples = if let Some(decoder) = opus_decoder.as_mut() {
-                                                    match decoder.decode(opus_data) {
-                                                        Ok(pcm) => pcm.len(),
-                                                        Err(_) => opus_data.len(),
-                                                    }
-                                                } else {
-                                                    opus_data.len()
-                                                };
-                                                let _ = state.event_tx.send(AppEvent::VoiceAudioFrame {
-                                                    guild_id: guild_id.get().to_string(),
-                                                    user_id: sender_user_id.to_string(),
-                                                    ssrc: header.ssrc,
-                                                    samples,
-                                                });
+                                                // DAVE session not ready yet — use transport-decrypted payload
+                                                decrypted_payload
                                             }
                                         } else {
-                                            drop(ssrc_map);
-                                            debug!("Unknown SSRC: {}", header.ssrc);
-                                        }
+                                            // No DAVE session — use transport-decrypted payload
+                                            decrypted_payload
+                                        };
+
+                                        // Step 4: Opus decode → PCM
+                                        let samples = if let Some(decoder) = opus_decoder.as_mut() {
+                                            match decoder.decode(&opus_data) {
+                                                Ok(pcm) => {
+                                                    debug!("Decoded Opus: {} bytes -> {} PCM samples (SSRC={}, user={})",
+                                                        opus_data.len(), pcm.len(), header.ssrc, sender_user_id);
+                                                    pcm.len()
+                                                }
+                                                Err(e) => {
+                                                    debug!("Failed to decode Opus: {} ({} bytes)", e, opus_data.len());
+                                                    0
+                                                }
+                                            }
+                                        } else {
+                                            opus_data.len()
+                                        };
+
+                                        let _ = state.event_tx.send(AppEvent::VoiceAudioFrame {
+                                            guild_id: guild_id.get().to_string(),
+                                            user_id: sender_user_id.to_string(),
+                                            ssrc: header.ssrc,
+                                            samples,
+                                        });
                                     }
                                     Err(e) => {
                                         warn!("Failed to parse RTP header: {}", e);

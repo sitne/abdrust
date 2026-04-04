@@ -220,9 +220,21 @@
   - `VoiceMetrics` 構造体（joins, leaves, frames, reconnects, heartbeat_acks等）
   - `GET /api/metrics` エンドポイント追加
   - `increment_voice_metric()` でカウントアップ可能
+- [x] clippy `-D warnings` 全修正
+- [x] Transport Encryption復号（RFC 7714準拠 AES-256-GCM）
 - [ ] SpeakingイベントのSSRC→user_idマッピング実テスト
 - [ ] 実際のDiscord音声チャンネルでの動作確認
 - [ ] crates.io公開 + docs.rsドキュメント
+
+#### Phase 3.3: Transport Encryption復号（完了）
+
+- [x] `aes-gcm = "0.10"` 依存追加
+- [x] `TransportCryptoMode` 列挙型（None, Aes256Gcm, XChaCha20Poly1305）
+- [x] RFC 7714準拠のnonce構築: `[0x00(2)][SSRC(4)][sequence(2)][0x00(4)]`
+- [x] `decrypt_transport()` — AES-256-GCM復号（AAD=RTPヘッダー）
+- [x] 音声受信パイプライン全面書き換え:
+  - UDP → RTP解析 → transport復号 → DAVE復号 → Opusデコード → PCM
+- [x] テスト4件追加（計15件）
 
 ### 工数見積もり
 
@@ -245,8 +257,8 @@
 | Phase 2.5: テスト・品質基盤 | 4-8時間 | 低 | ✅ 完了 |
 | Phase 2.6: Activityインスタンス分離 | 2-4時間 | 低 | ✅ 完了 |
 | Phase 2.7: DAVE passthroughフォールバック | 2-4時間 | 中 | ✅ 完了 |
-| Phase 3.1: マルチギルド + ADR導入 | 2-4時間 | 低 | ✅ 完了 |
-| Phase 3.2: ハートビート改善 + メトリクス | 2-4時間 | 低 | ✅ 完了 |
+| Phase 3.2: ハートビート + メトリクス + clippy | 2-4時間 | 低 | ✅ 完了 |
+| Phase 3.3: Transport Encryption復号 | 2-4時間 | 中 | ✅ 完了 |
 | Phase 3: 基盤安定化（残） | 3-6ヶ月 | 中 | 進行中 |
 
 ---
@@ -789,6 +801,7 @@ ACTIVE → INACTIVE           : reset()
 
 | 日付 | 変更 |
 |------|------|
+| 2026-04-04 | Phase 3.3完了: Transport Encryption復号（RFC 7714 AES-256-GCM）+ テスト15件 |
 | 2026-04-03 | Phase 3.2完了: ハートビート改善 + メトリクス収集 + dev-log整理 |
 | 2026-04-03 | Phase 3.1完了: マルチギルド対応（SHARD_COUNT/SHARD_IDS環境変数）+ ADR導入（docs/adr/） |
 | 2026-04-03 | Phase 2.7完了: DAVE passthroughフォールバック + エラーハンドリング改善 |

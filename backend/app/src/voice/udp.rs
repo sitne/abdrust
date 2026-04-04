@@ -1,3 +1,5 @@
+use aes_gcm::aead::{Aead, Payload};
+use aes_gcm::{Aes256Gcm, KeyInit, Nonce};
 use anyhow::{Context, Result};
 use byteorder::{BigEndian, WriteBytesExt};
 use std::net::{SocketAddr, UdpSocket};
@@ -129,6 +131,48 @@ impl RtpHeader {
         }
 
         buf
+    }
+}
+
+/// Transport encryption modes supported by Discord
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TransportCryptoMode {
+    /// No transport encryption (legacy)
+    None,
+    /// AES-256-GCM with RTP-size nonce (RFC 7714)
+    Aes256Gcm,
+    /// XChaCha20-Poly1305 with RTP-size nonce
+    XChaCha20Poly1305,
+}
+
+impl TransportCryptoMode {
+    pub fn from_str(mode: &str) -> Self {
+        match mode {
+            "aead_aes256_gcm_rtpsize" => Self::Aes256Gcm,
+            "aead_xchacha20_poly1305_rtpsize" => Self::XChaCha20Poly1305,
+            _ => Self::None,
+        }
+    }
+
+    /// AEAD tag size in bytes
+    pub fn tag_size(&self) -> usize {
+        match self {
+            Self::Aes256Gcm | Self::XChaCha20Poly1305 => 16,
+            Self::None => 0,
+        }
+    }
+
+    /// Build 12-byte nonce for AES-256-GCM per RFC 7714
+    /// Format: [0x00 (2 bytes)][SSRC (4 bytes)][sequence (2 bytes)][0x00 (4 bytes)]
+    pub fn build_nonce(&self, ssrc: u32, sequence: u16) -> [u8; 12] {
+        let mut nonce = [0u8; 12];
+        // bytes 0-1: 0x00 (already zero)
+        // bytes 2-5: SSRC (big-endian)
+        nonce[2..6].copy_from_slice(&ssrc.to_be_bytes());
+        // bytes 6-7: sequence number (big-endian)
+        nonce[6..8].copy_from_slice(&sequence.to_be_bytes());
+        // bytes 8-11: 0x00 (already zero)
+        nonce
     }
 }
 
@@ -310,6 +354,62 @@ impl VoiceUdpSocket {
     /// Update the secret key (received from Session Description)
     pub fn set_secret_key(&mut self, key: [u8; 32]) {
         self.secret_key = key;
+    }
+
+    /// Decrypt transport-encrypted RTP payload
+    ///
+    /// For AES-256-GCM (RFC 7714):
+    /// - Input: [RTP header][ciphertext][16-byte AEAD tag]
+    /// - Nonce: [0x00(2)][SSRC(4)][sequence(4)][0x00(2)]
+    /// - AAD: RTP header (authenticated but not encrypted)
+    /// - Output: [RTP header][plaintext payload]
+    pub fn decrypt_transport(
+        &self,
+        rtp_header: &[u8],
+        payload_with_tag: &[u8],
+        ssrc: u32,
+        sequence: u16,
+    ) -> Result<Vec<u8>> {
+        let mode = TransportCryptoMode::from_str(&self.encryption_mode);
+
+        if mode == TransportCryptoMode::None {
+            return Ok(payload_with_tag.to_vec());
+        }
+
+        let tag_size = mode.tag_size();
+        if payload_with_tag.len() < tag_size {
+            anyhow::bail!(
+                "payload too short for AEAD tag: {} bytes",
+                payload_with_tag.len()
+            );
+        }
+
+        match mode {
+            TransportCryptoMode::Aes256Gcm => {
+                let cipher = Aes256Gcm::new_from_slice(&self.secret_key)
+                    .context("failed to create AES-256-GCM cipher")?;
+
+                let nonce_bytes = mode.build_nonce(ssrc, sequence);
+                let nonce = Nonce::from_slice(&nonce_bytes);
+
+                // RFC 7714: AAD = RTP header, ciphertext = payload_with_tag
+                let payload = Payload {
+                    msg: payload_with_tag,
+                    aad: rtp_header,
+                };
+                let plaintext = cipher
+                    .decrypt(nonce, payload)
+                    .map_err(|e| anyhow::anyhow!("AES-256-GCM decrypt failed: {}", e))?;
+
+                Ok(plaintext)
+            }
+            TransportCryptoMode::XChaCha20Poly1305 => {
+                // TODO: implement XChaCha20-Poly1305
+                warn!("XChaCha20-Poly1305 transport decryption not yet implemented");
+                Ok(payload_with_tag.to_vec())
+            }
+            TransportCryptoMode::None => Ok(payload_with_tag.to_vec()),
+        }
     }
 }
 
@@ -577,5 +677,96 @@ mod tests {
         assert_eq!(header.timestamp, 960);
         assert_eq!(header.ssrc, 0x00010203);
         assert_eq!(offset, 12);
+    }
+
+    #[test]
+    fn test_transport_crypto_mode_from_str() {
+        assert_eq!(
+            TransportCryptoMode::from_str("aead_aes256_gcm_rtpsize"),
+            TransportCryptoMode::Aes256Gcm
+        );
+        assert_eq!(
+            TransportCryptoMode::from_str("aead_xchacha20_poly1305_rtpsize"),
+            TransportCryptoMode::XChaCha20Poly1305
+        );
+        assert_eq!(
+            TransportCryptoMode::from_str("xsalsa20_poly1305"),
+            TransportCryptoMode::None
+        );
+        assert_eq!(
+            TransportCryptoMode::from_str("unknown"),
+            TransportCryptoMode::None
+        );
+    }
+
+    #[test]
+    fn test_transport_crypto_mode_tag_size() {
+        assert_eq!(TransportCryptoMode::Aes256Gcm.tag_size(), 16);
+        assert_eq!(TransportCryptoMode::XChaCha20Poly1305.tag_size(), 16);
+        assert_eq!(TransportCryptoMode::None.tag_size(), 0);
+    }
+
+    #[test]
+    fn test_transport_crypto_mode_build_nonce() {
+        let mode = TransportCryptoMode::Aes256Gcm;
+        let nonce = mode.build_nonce(0x01020304, 0x0042);
+
+        // Expected: [0x00, 0x00, SSRC(4 bytes BE), sequence(2 bytes BE), 0x00, 0x00, 0x00, 0x00]
+        assert_eq!(nonce[0], 0x00);
+        assert_eq!(nonce[1], 0x00);
+        assert_eq!(&nonce[2..6], &0x01020304u32.to_be_bytes());
+        assert_eq!(&nonce[6..8], &0x0042u16.to_be_bytes());
+        assert_eq!(&nonce[8..12], &[0x00, 0x00, 0x00, 0x00]);
+    }
+
+    #[test]
+    fn test_transport_decrypt_aes256_gcm_roundtrip() {
+        use aes_gcm::aead::Aead as _;
+        use aes_gcm::{Aes256Gcm as AesGcmCipher, KeyInit as _, Nonce as GcmNonce};
+
+        // Create a test socket with a known secret key
+        let socket = UdpSocket::bind("127.0.0.1:0").unwrap();
+        let remote: SocketAddr = "127.0.0.1:9999".parse().unwrap();
+        let secret_key = [0x42u8; 32]; // Test key
+        let mut udp = VoiceUdpSocket::from_raw(
+            socket,
+            remote,
+            0x01020304, // SSRC
+            secret_key,
+            "aead_aes256_gcm_rtpsize".to_string(),
+        )
+        .unwrap();
+
+        // Build RTP header
+        let rtp_header: Vec<u8> = vec![
+            0x80, 0x78, // V=2, PT=Opus
+            0x00, 0x01, // sequence = 1
+            0x00, 0x00, 0x00, 0x00, // timestamp = 0
+            0x01, 0x02, 0x03, 0x04, // SSRC
+        ];
+
+        // Original payload (simulated Opus data)
+        let original_payload: Vec<u8> = vec![0xF8, 0xFF, 0xFE, 0x00, 0x01, 0x02];
+
+        // Encrypt using AES-256-GCM per RFC 7714:
+        // - AAD = RTP header
+        // - Plaintext = payload
+        // - Nonce = [0,0,SSRC,seq,0,0,0,0]
+        let cipher = AesGcmCipher::new_from_slice(&secret_key).unwrap();
+        let nonce_bytes = TransportCryptoMode::Aes256Gcm.build_nonce(0x01020304, 1);
+        let nonce = GcmNonce::from_slice(&nonce_bytes);
+
+        // Encrypt payload with RTP header as AAD
+        let payload = aes_gcm::aead::Payload {
+            msg: original_payload.as_ref(),
+            aad: &rtp_header,
+        };
+        let ciphertext_with_tag = cipher.encrypt(&nonce, payload).unwrap();
+
+        // Decrypt using our implementation
+        let result = udp.decrypt_transport(&rtp_header, &ciphertext_with_tag, 0x01020304, 1);
+        assert!(result.is_ok());
+        let decrypted = result.unwrap();
+        assert_eq!(decrypted, original_payload);
     }
 }
